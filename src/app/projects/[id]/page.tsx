@@ -7,7 +7,7 @@ import { SessionProvider } from "next-auth/react";
 import { useRouter, useParams } from "next/navigation";
 import { useEffect, useState, useCallback } from "react";
 import Link from "next/link";
-import { getProject, updateProject, getAIKey, type Project, type SoftwareMeta } from "@/lib/storage";
+import { getProject, updateProject, getAIKey, getManualDraft, clearManualDraft, type Project, type SoftwareMeta, type ManualDraft } from "@/lib/storage";
 import { fetchRepoFiles, fetchRepoStats } from "@/lib/github";
 import { generateManualMarkdown, callAIForText, buildMetadataPrompt } from "@/lib/ai-helpers";
 import { generateCodePDF } from "@/lib/docgen/code-pdf";
@@ -32,6 +32,7 @@ function ProjectDetailContent() {
   const [metaReady, setMetaReady] = useState(false);
   const [codePdfUrl, setCodePdfUrl] = useState<string | null>(null);
   const [manualPdfUrl, setManualPdfUrl] = useState<string | null>(null);
+  const [manualDraft, setManualDraft] = useState<ManualDraft | null>(null);
 
   const accessToken = (session as { accessToken?: string })?.accessToken;
 
@@ -50,6 +51,7 @@ function ProjectDetailContent() {
       if (!p) { router.push("/dashboard"); return; }
       setProject(p);
       setMeta(p.meta);
+      setManualDraft(getManualDraft(projectId));
     };
     void loadProject();
     return () => { active = false; };
@@ -137,8 +139,14 @@ function ProjectDetailContent() {
     detectMeta();
   }, [project, accessToken, projectId, metaReady]);
 
-  const startGenerate = useCallback(async () => {
+  const startGenerate = useCallback(async (opts?: { resumeManual?: boolean; freshManual?: boolean }) => {
     if (!project || !accessToken || !meta) return;
+
+    const resumeManual = !!opts?.resumeManual;
+    if (opts?.freshManual) {
+      clearManualDraft(projectId);
+      setManualDraft(null);
+    }
 
     setGenerating(true);
     setError("");
@@ -170,11 +178,28 @@ function ProjectDetailContent() {
       const codePDFBlob = await generateCodePDF(project.softwareName, project.version, files);
 
       // Step 4: Generate manual PDF (文档鉴别材料)
-      setStepIndex(4); setCurrentStep("正在生成文档鉴别材料..."); setProgress(50);
+      setStepIndex(4);
+      setCurrentStep(
+        resumeManual || getManualDraft(projectId)?.markdown
+          ? "正在从断点接续生成文档鉴别材料..."
+          : "正在生成文档鉴别材料..."
+      );
+      setProgress(50);
+
+      const existingDraft = getManualDraft(projectId);
       const manualMarkdown = await generateManualMarkdown(
         project.softwareName, project.version, meta,
         project.repoUrl, languageStr, fileTree, codeSummary,
-        (msg) => setCurrentStep(msg)
+        {
+          projectId,
+          resumeMarkdown: resumeManual || existingDraft?.markdown ? existingDraft?.markdown : undefined,
+          resumeAttempt: existingDraft?.attempt,
+          onProgress: (msg) => {
+            setCurrentStep(msg);
+            const draft = getManualDraft(projectId);
+            if (draft) setManualDraft(draft);
+          },
+        }
       );
 
       setCurrentStep("正在排版文档鉴别材料 PDF..."); setProgress(70);
@@ -184,13 +209,16 @@ function ProjectDetailContent() {
 
       // Step 5: Done
       setStepIndex(5); setCurrentStep("生成完成！"); setProgress(100);
-      updateProject(projectId, { status: "DONE", meta: { ...meta, sourceLines: totalSourceLines } });
+      clearManualDraft(projectId);
+      setManualDraft(null);
+      updateProject(projectId, { status: "DONE", meta: { ...meta, sourceLines: totalSourceLines }, errorMsg: undefined });
       setProject(getProject(projectId)!);
       setCodePdfUrl(URL.createObjectURL(codePDFBlob));
       setManualPdfUrl(URL.createObjectURL(manualPDFBlob));
     } catch (e) {
       const msg = e instanceof Error ? e.message : "未知错误";
       setError(msg);
+      setManualDraft(getManualDraft(projectId));
       updateProject(projectId, { status: "FAILED", errorMsg: msg });
       setProject(getProject(projectId)!);
     } finally {
@@ -253,10 +281,13 @@ function ProjectDetailContent() {
               </div>
             </div>
 
-            <button onClick={startGenerate} disabled={!metaReady}
+            <button onClick={() => startGenerate()} disabled={!metaReady}
               className="w-full py-3 bg-[var(--color-primary)] hover:bg-[var(--color-primary-hover)] text-white rounded-lg font-medium transition-colors disabled:opacity-50 disabled:cursor-not-allowed">
               {metaReady ? "确认信息并开始生成" : "正在检测元数据..."}
             </button>
+            <p className="text-xs text-[var(--color-muted)] text-center">
+              说明：程序鉴别材料来自源码（常见要求约 3000–6000 行源程序）；文档鉴别材料是操作说明书，目标约 2000 行文档内容以排成约 60 页，不是代码行数。
+            </p>
           </div>
         )}
 
@@ -265,12 +296,17 @@ function ProjectDetailContent() {
           <div className="py-8">
             <div className="mb-6">
               <div className="flex items-center justify-between mb-2">
-                <span className="text-sm text-[var(--color-muted)]">{currentStep}</span>
+                <span className="text-sm text-[var(--color-muted)]">{currentStep || "准备中..."}</span>
                 <span className="text-sm font-medium">{progress}%</span>
               </div>
               <div className="w-full h-2 bg-[var(--color-border)] rounded-full overflow-hidden">
                 <div className="h-full bg-[var(--color-primary)] transition-all duration-500 ease-out rounded-full" style={{ width: `${progress}%` }} />
               </div>
+              {manualDraft?.lines ? (
+                <p className="text-xs text-[var(--color-muted)] mt-2">
+                  说明书草稿已缓存：{manualDraft.lines} 行文档（中断后可从断点继续，不必整份重写）
+                </p>
+              ) : null}
             </div>
             <div className="space-y-3">
               {steps.map((step, i) => {
@@ -314,7 +350,7 @@ function ProjectDetailContent() {
                 下载文档鉴别材料
               </button>
             </div>
-            <button onClick={() => { updateProject(projectId, { status: "PENDING" }); setProject(getProject(projectId)!); setMetaReady(false); setCodePdfUrl(null); setManualPdfUrl(null); }}
+            <button onClick={() => { clearManualDraft(projectId); setManualDraft(null); updateProject(projectId, { status: "PENDING" }); setProject(getProject(projectId)!); setMetaReady(false); setCodePdfUrl(null); setManualPdfUrl(null); }}
                 className="px-6 py-3 border border-[var(--color-border)] rounded-lg text-sm text-[var(--color-muted)] hover:text-[var(--color-foreground)] hover:border-[var(--color-muted)] transition-colors">重新生成</button>
 
             {/* Registration form reference */}
@@ -376,16 +412,46 @@ function ProjectDetailContent() {
         )}
 
         {/* Failed */}
-        {project.status === "FAILED" && (
+        {project.status === "FAILED" && !generating && (
           <div className="py-8">
             <div className="bg-[var(--color-error)]/10 border border-[var(--color-error)]/20 rounded-xl p-6 mb-6">
               <div className="flex items-center gap-3 mb-2">
                 <svg className="w-6 h-6 text-[var(--color-error)]" fill="none" viewBox="0 0 24 24" stroke="currentColor"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M6 18L18 6M6 6l12 12" /></svg>
                 <span className="text-lg font-semibold text-[var(--color-error)]">生成失败</span>
               </div>
-              <p className="text-sm text-[var(--color-muted)]">{project.errorMsg || error || "未知错误，请重试。"}</p>
+              <p className="text-sm text-[var(--color-muted)] whitespace-pre-wrap">{project.errorMsg || error || "未知错误，请重试。"}</p>
+              {manualDraft?.markdown && (
+                <div className="mt-4 rounded-lg border border-[var(--color-primary)]/30 bg-[var(--color-primary)]/10 px-3 py-2 text-sm">
+                  已保存说明书草稿：
+                  <span className="font-medium ml-1">{manualDraft.lines || 0} 行文档</span>
+                  <span className="text-[var(--color-muted)] text-xs ml-2">
+                    更新于 {new Date(manualDraft.updatedAt).toLocaleString("zh-CN")}
+                  </span>
+                  <p className="text-xs text-[var(--color-muted)] mt-1">
+                    可从断点继续，不必整份重写。程序鉴别材料仍会重新排版生成。
+                  </p>
+                </div>
+              )}
             </div>
-            <button onClick={startGenerate} className="px-6 py-3 bg-[var(--color-primary)] hover:bg-[var(--color-primary-hover)] text-white rounded-lg font-medium transition-colors">重新生成</button>
+            <div className="flex flex-wrap gap-3">
+              {manualDraft?.markdown ? (
+                <button
+                  onClick={() => startGenerate({ resumeManual: true })}
+                  className="px-6 py-3 bg-[var(--color-primary)] hover:bg-[var(--color-primary-hover)] text-white rounded-lg font-medium transition-colors"
+                >
+                  从断点继续生成说明书
+                </button>
+              ) : null}
+              <button
+                onClick={() => startGenerate(manualDraft?.markdown ? { freshManual: true } : undefined)}
+                className="px-6 py-3 border border-[var(--color-border)] hover:border-[var(--color-primary)] rounded-lg font-medium transition-colors"
+              >
+                {manualDraft?.markdown ? "放弃草稿，重新开始" : "重新生成"}
+              </button>
+            </div>
+            <p className="text-xs text-[var(--color-muted)] mt-4">
+              小提示：进度里的「目标 2000 行」指操作说明书文档行数（用于文档鉴别材料约 60 页），不是源程序 6000 行。源程序行数在「程序鉴别材料」里按仓库代码处理。
+            </p>
           </div>
         )}
       </main>

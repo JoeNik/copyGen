@@ -8,7 +8,8 @@ import { useSession, signOut } from "next-auth/react";
 import { SessionProvider } from "next-auth/react";
 import { useRouter } from "next/navigation";
 import { useEffect, useState, useMemo } from "react";
-import { getProjects, getAIKey, deleteProject, deleteProjects, type Project } from "@/lib/storage";
+import { getProjects, getAIKey, getActiveProvider, deleteProject, deleteProjects, type Project } from "@/lib/storage";
+import AISettingsModal from "@/components/AISettingsModal";
 
 const statusConfig: Record<string, { label: string; color: string }> = {
   PENDING: { label: "待处理", color: "bg-zinc-500/20 text-zinc-400" },
@@ -35,6 +36,8 @@ function DashboardContent() {
   const [sortAsc, setSortAsc] = useState(false);
   const [search, setSearch] = useState("");
   const [confirmDelete, setConfirmDelete] = useState<string | null>(null);
+  const [showSettings, setShowSettings] = useState(false);
+  const [activeLabel, setActiveLabel] = useState(() => getActiveProvider()?.label || "");
 
   useEffect(() => {
     if (status === "unauthenticated") router.push("/");
@@ -120,6 +123,13 @@ function DashboardContent() {
             <span className="text-lg font-semibold">软著通</span>
           </Link>
           <div className="flex items-center gap-4">
+            <button
+              onClick={() => setShowSettings(true)}
+              className="text-sm text-[var(--color-muted)] hover:text-[var(--color-foreground)] transition-colors"
+              title="AI 提供商设置"
+            >
+              {activeLabel ? `AI: ${activeLabel}` : "配置 AI"}
+            </button>
             <div className="flex items-center gap-2">
               {session.user?.image && <Image src={session.user.image} alt="" width={28} height={28} unoptimized className="rounded-full" />}
               <span className="text-sm text-[var(--color-muted)]">{session.user?.name}</span>
@@ -238,6 +248,17 @@ function DashboardContent() {
           </div>
         )}
       </main>
+
+      {showSettings && (
+        <AISettingsModal
+          onClose={() => {
+            setActiveLabel(getActiveProvider()?.label || "");
+            setShowSettings(false);
+            if (!getAIKey()) router.push("/");
+          }}
+          onSaved={() => setActiveLabel(getActiveProvider()?.label || "")}
+        />
+      )}
     </div>
   );
 }

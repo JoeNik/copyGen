@@ -1,4 +1,4 @@
-import { getAIProtocol, getAIBaseUrl, getAIModel, type AIProtocol } from "@/lib/storage";
+import { getAIBaseUrl, getAIModel, getActiveProvider, type AIProtocol } from "@/lib/storage";
 
 interface ProviderConfig {
   protocol: AIProtocol;
@@ -13,6 +13,24 @@ async function proxyFetch(url: string, init: RequestInit): Promise<Response> {
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify({ targetUrl: url, method: init.method || "POST", headers: init.headers, body: init.body }),
   });
+}
+
+/** Build OpenAI-compatible chat completions URL from a flexible base. */
+function openaiChatCompletionsUrl(baseUrl: string): string {
+  const b = baseUrl.replace(/\/+$/, "");
+  if (b.endsWith("/chat/completions")) return b;
+  // Already versioned path, e.g. https://open.bigmodel.cn/api/paas/v4
+  if (/\/v\d+$/i.test(b)) return `${b}/chat/completions`;
+  // Base already ends with /v1
+  if (/\/v1$/i.test(b)) return `${b}/chat/completions`;
+  return `${b}/v1/chat/completions`;
+}
+
+function claudeMessagesUrl(baseUrl: string): string {
+  const b = baseUrl.replace(/\/+$/, "");
+  if (b.endsWith("/messages")) return b;
+  if (/\/v1$/i.test(b)) return `${b}/messages`;
+  return `${b}/v1/messages`;
 }
 
 /** Extract text + finish reason from a single OpenAI/Claude/Gemini JSON payload. */
@@ -199,12 +217,12 @@ async function callAI(messages: { role: string; content: string }[], config: Pro
   let body: string;
 
   if (config.protocol === "openai") {
-    url = `${config.baseUrl}/v1/chat/completions`;
+    url = openaiChatCompletionsUrl(config.baseUrl);
     headers = { "Content-Type": "application/json", Authorization: `Bearer ${config.apiKey}` };
     body = JSON.stringify({ model: config.model, max_tokens: 200, messages });
   } else if (config.protocol === "claude") {
     const { system, rest } = splitSystemMessages(messages);
-    url = `${config.baseUrl}/v1/messages`;
+    url = claudeMessagesUrl(config.baseUrl);
     headers = {
       "Content-Type": "application/json",
       "x-api-key": config.apiKey,
@@ -221,7 +239,8 @@ async function callAI(messages: { role: string; content: string }[], config: Pro
     const contents = messages
       .filter((m) => m.role !== "system")
       .map((m) => ({ role: m.role === "assistant" ? "model" : "user", parts: [{ text: m.content }] }));
-    url = `${config.baseUrl}/v1beta/models/${config.model}:generateContent?key=${config.apiKey}`;
+    const b = config.baseUrl.replace(/\/+$/, "");
+    url = `${b}/v1beta/models/${config.model}:generateContent?key=${config.apiKey}`;
     headers = { "Content-Type": "application/json" };
     body = JSON.stringify({ contents, generationConfig: { maxOutputTokens: 200 } });
   }
@@ -236,11 +255,13 @@ async function callAI(messages: { role: string; content: string }[], config: Pro
 }
 
 export async function callAIForText(prompt: string): Promise<string> {
+  const active = getActiveProvider();
+  if (!active) throw new Error("请先在设置中配置并启用一个 AI 提供商");
   const config: ProviderConfig = {
-    protocol: getAIProtocol(),
-    apiKey: (await import("@/lib/storage")).getAIKey() || "",
-    baseUrl: getAIBaseUrl(),
-    model: getAIModel(),
+    protocol: active.protocol,
+    apiKey: active.apiKey,
+    baseUrl: active.baseUrl || getAIBaseUrl(),
+    model: active.model || getAIModel(),
   };
   return callAI([{ role: "user", content: prompt }], config);
 }
@@ -329,11 +350,13 @@ ${codeSummary}
 const MAX_TOKENS = 8192;
 
 export async function callAILong(messages: { role: string; content: string }[]): Promise<{ text: string; finishReason: string }> {
+  const active = getActiveProvider();
+  if (!active) throw new Error("请先在设置中配置并启用一个 AI 提供商");
   const config: ProviderConfig = {
-    protocol: getAIProtocol(),
-    apiKey: (await import("@/lib/storage")).getAIKey() || "",
-    baseUrl: getAIBaseUrl(),
-    model: getAIModel(),
+    protocol: active.protocol,
+    apiKey: active.apiKey,
+    baseUrl: active.baseUrl || getAIBaseUrl(),
+    model: active.model || getAIModel(),
   };
 
   let url: string;
@@ -341,13 +364,13 @@ export async function callAILong(messages: { role: string; content: string }[]):
   let body: string;
 
   if (config.protocol === "openai") {
-    url = `${config.baseUrl}/v1/chat/completions`;
+    url = openaiChatCompletionsUrl(config.baseUrl);
     headers = { "Content-Type": "application/json", Authorization: `Bearer ${config.apiKey}` };
     // stream:true is more reliable through reverse proxies that inject heartbeats
     body = JSON.stringify({ model: config.model, max_tokens: MAX_TOKENS, stream: true, messages });
   } else if (config.protocol === "claude") {
     const { system, rest } = splitSystemMessages(messages);
-    url = `${config.baseUrl}/v1/messages`;
+    url = claudeMessagesUrl(config.baseUrl);
     headers = {
       "Content-Type": "application/json",
       "x-api-key": config.apiKey,
@@ -366,7 +389,8 @@ export async function callAILong(messages: { role: string; content: string }[]):
       .filter((m) => m.role !== "system")
       .map((m) => ({ role: m.role === "assistant" ? "model" : "user", parts: [{ text: m.content }] }));
     const systemInstruction = messages.find((m) => m.role === "system")?.content;
-    url = `${config.baseUrl}/v1beta/models/${config.model}:streamGenerateContent?alt=sse&key=${config.apiKey}`;
+    const b = config.baseUrl.replace(/\/+$/, "");
+    url = `${b}/v1beta/models/${config.model}:streamGenerateContent?alt=sse&key=${config.apiKey}`;
     headers = { "Content-Type": "application/json" };
     body = JSON.stringify({
       contents,
@@ -383,6 +407,69 @@ export async function callAILong(messages: { role: string; content: string }[]):
   return parseAIResponse(res, config.protocol);
 }
 
+function countNonEmptyLines(text: string): number {
+  return text.split("\n").filter((l) => l.trim()).length;
+}
+
+function sleep(ms: number) {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+/**
+ * Call long-form AI with automatic retries. Does not discard previously
+ * accumulated manual text — callers keep that outside this function.
+ */
+async function callAILongWithRetry(
+  messages: { role: string; content: string }[],
+  onProgress?: (msg: string) => void,
+  label = "生成"
+): Promise<{ text: string; finishReason: string }> {
+  const MAX_RETRIES = 5;
+  let lastError: unknown;
+
+  for (let retry = 0; retry <= MAX_RETRIES; retry++) {
+    try {
+      if (retry > 0) {
+        const waitSec = Math.min(30, 2 ** retry);
+        onProgress?.(`${label}失败，${waitSec}s 后自动重试 (${retry}/${MAX_RETRIES})...`);
+        await sleep(waitSec * 1000);
+        onProgress?.(`正在重试${label}... (${retry}/${MAX_RETRIES})`);
+      }
+      const result = await callAILong(messages);
+      // Empty body on success is also worth a retry once or twice
+      if (!result.text.trim() && retry < MAX_RETRIES) {
+        lastError = new Error("AI 返回空内容");
+        continue;
+      }
+      return result;
+    } catch (e) {
+      lastError = e;
+      // 401/403: fail fast
+      if (/AI API 错误 \((401|403)\)/i.test(e instanceof Error ? e.message : String(e))) break;
+      if (retry >= MAX_RETRIES) break;
+    }
+  }
+
+  throw lastError instanceof Error ? lastError : new Error(String(lastError));
+}
+
+export interface GenerateManualOptions {
+  /** Persist/resume draft by project id */
+  projectId?: string;
+  /** Existing draft markdown to continue from */
+  resumeMarkdown?: string;
+  /** Starting attempt counter when resuming */
+  resumeAttempt?: number;
+  onProgress?: (msg: string) => void;
+  /**
+   * Target non-empty Markdown lines for 文档鉴别材料.
+   * This is NOT source-code line count (源程序约 3000–6000 行是另一回事).
+   * Soft copyright manuals are usually deposited as ~60 pages; ~1500–2000
+   * non-empty doc lines is enough to paginate into that range.
+   */
+  minLines?: number;
+}
+
 export async function generateManualMarkdown(
   softwareName: string,
   version: string,
@@ -391,11 +478,26 @@ export async function generateManualMarkdown(
   languages: string,
   fileTree: string,
   codeSummary: string,
-  onProgress?: (msg: string) => void
+  onProgressOrOpts?: ((msg: string) => void) | GenerateManualOptions
 ): Promise<string> {
-  const systemPrompt = "你是一名专业的软件著作权申报文档撰写专家。请直接输出完整的 Markdown 文档，不要输出 JSON。每章内容要极其详实，每个功能点都要展开详细的步骤说明，每段至少5句话。";
+  const opts: GenerateManualOptions =
+    typeof onProgressOrOpts === "function"
+      ? { onProgress: onProgressOrOpts }
+      : onProgressOrOpts || {};
 
-  const userPrompt = `请生成《${softwareName}》的完整操作说明书（Markdown 格式）。文档必须非常详尽，目标总行数 2000 行以上。
+  const onProgress = opts.onProgress;
+  // 文档鉴别材料目标行数（说明书 Markdown），与源程序 6000 行无关
+  const MIN_LINES = opts.minLines ?? 2000;
+  const MAX_ROUNDS = 20;
+  const PERSIST_EVERY = true;
+
+  const { saveManualDraft, clearManualDraft, getManualDraft } = await import("@/lib/storage");
+
+  const systemPrompt =
+    "你是一名专业的软件著作权申报文档撰写专家。请直接输出完整的 Markdown 文档，不要输出 JSON。每章内容要极其详实，每个功能点都要展开详细的步骤说明，每段至少5句话。";
+
+  const userPrompt = `请生成《${softwareName}》的完整操作说明书（Markdown 格式）。
+说明：这里的“行数”指说明书文档行数，用于排版成文档鉴别材料 PDF（一般交存前后各约 30 页），不是源程序代码行数。
 
 软件信息：
 - 名称：${softwareName} ${version}
@@ -414,7 +516,7 @@ ${fileTree}
 代码摘要：
 ${codeSummary}
 
-章节要求（每章必须内容充实，不少于200行）：
+章节要求（每章必须内容充实，不少于 150 行）：
 # 第一章 软件概述（背景、目标用户分析、核心功能列表、技术架构概述、版本历史）
 # 第二章 运行环境（硬件要求详细说明、软件依赖列表、网络要求、安全要求）
 # 第三章 软件安装与卸载（Windows安装、Linux安装、macOS安装、Docker部署、卸载步骤）
@@ -428,52 +530,151 @@ ${codeSummary}
 - 使用正式的中文公文写作风格
 - 每段落不少于5句话，内容要详实具体
 - 图片位置用 [图X-X：描述] 占位符标注
+- 目标总行数 ${MIN_LINES} 行以上（说明书文档行，非代码行）
 - 只输出 Markdown，不要输出其他说明`;
 
-  const messages: { role: string; content: string }[] = [
-    { role: "system", content: systemPrompt },
-    { role: "user", content: userPrompt },
-  ];
+  // Resume from explicit arg or saved draft
+  let allText = opts.resumeMarkdown || "";
+  let attempt = opts.resumeAttempt || 0;
+  let emptyStreak = 0;
+  let lastTruncated = false;
 
-  let allText = "";
-  let attempt = 0;
-  const MAX_ATTEMPTS = 15;
-  const MIN_LINES = 2000;
-
-  while (attempt < MAX_ATTEMPTS) {
-    attempt++;
-    const currentLines = allText.split("\n").filter((l) => l.trim()).length;
-    onProgress?.(`正在${attempt === 1 ? "" : "接续"}生成说明书... (第${attempt}次, 已${currentLines}行, 目标${MIN_LINES}行)`);
-
-    const { text, finishReason } = await callAILong(messages);
-    allText += text;
-
-    const totalLines = allText.split("\n").filter((l) => l.trim()).length;
-    const fr = finishReason.toLowerCase();
-    const truncated = fr === "length" || fr === "max_tokens";
-
-    if (totalLines >= MIN_LINES) break;
-    if (!text.trim() && attempt > 1) break;
-
-    // Need more content — continue
-    messages.length = 0;
-    if (truncated) {
-      messages.push(
-        { role: "system", content: systemPrompt },
-        { role: "user", content: userPrompt },
-        { role: "assistant", content: allText.slice(-6000) },
-        { role: "user", content: `内容被截断了（当前${totalLines}行，目标${MIN_LINES}行）。请从截断处继续输出大量内容。要求：\n1. 不要重复已有内容\n2. 每个章节都要大幅扩展，每段至少5句话\n3. 第五章每个功能模块要写30行以上\n4. 第六章Q&A要扩充到20条以上\n5. 尽可能多地输出内容，一次至少输出500行` },
-      );
-    } else {
-      messages.push(
-        { role: "system", content: systemPrompt },
-        { role: "user", content: userPrompt },
-        { role: "assistant", content: allText.slice(-6000) },
-        { role: "user", content: `当前内容只有${totalLines}行，距离目标${MIN_LINES}行还差很多。请大幅扩展内容：\n- 第五章每个功能模块要写详细的子功能说明、操作步骤（每步3-5句话）\n- 第六章扩充到20条Q&A，每条回答至少3句话\n- 第七章列出至少10个错误码及解决方案\n- 每段都要充实，不要一句话带过\n- 一次至少输出500行新内容\n不要重复已有内容，直接从文末继续补充。` },
+  if (!allText && opts.projectId) {
+    const draft = getManualDraft(opts.projectId);
+    if (draft?.markdown && !draft.complete) {
+      allText = draft.markdown;
+      attempt = draft.attempt || 0;
+      onProgress?.(
+        `发现未完成的说明书草稿（${draft.lines || countNonEmptyLines(allText)} 行），从断点继续...`
       );
     }
   }
 
+  const persist = (complete = false) => {
+    if (!opts.projectId || !PERSIST_EVERY) return;
+    const lines = countNonEmptyLines(allText);
+    if (!allText.trim()) return;
+    saveManualDraft({
+      projectId: opts.projectId,
+      softwareName,
+      version,
+      markdown: allText,
+      lines,
+      attempt,
+      updatedAt: new Date().toISOString(),
+      complete,
+    });
+  };
+
+  const buildContinueMessages = (totalLines: number, truncated: boolean) => {
+    const tail = allText.slice(-8000);
+    if (truncated) {
+      return [
+        { role: "system", content: systemPrompt },
+        { role: "user", content: userPrompt },
+        { role: "assistant", content: tail },
+        {
+          role: "user",
+          content: `内容被截断了（当前说明书 ${totalLines} 行，目标 ${MIN_LINES} 行文档行）。请紧接着上文末尾继续写，不要重复已有章节标题和段落。尽量一次输出 400 行以上新内容。`,
+        },
+      ];
+    }
+    return [
+      { role: "system", content: systemPrompt },
+      { role: "user", content: userPrompt },
+      { role: "assistant", content: tail },
+      {
+        role: "user",
+        content: `当前说明书只有 ${totalLines} 行（文档行，非代码行），目标 ${MIN_LINES} 行。请从文末继续大幅扩充，不要重复已有内容：\n- 补全尚未写完的章节\n- 第五章每个功能模块写清操作步骤\n- 第六章扩到 20 条以上 Q&A\n- 第七章至少 10 个错误码\n一次至少输出 400 行新内容。`,
+      },
+    ];
+  };
+
+  while (attempt < MAX_ROUNDS) {
+    attempt++;
+    const currentLines = countNonEmptyLines(allText);
+    const isContinue = currentLines > 0;
+    onProgress?.(
+      `正在${isContinue ? "接续" : ""}生成说明书... (第 ${attempt} 轮, 已 ${currentLines} 行文档 / 目标 ${MIN_LINES} 行)`
+    );
+
+    const messages =
+      currentLines === 0
+        ? [
+            { role: "system", content: systemPrompt },
+            { role: "user", content: userPrompt },
+          ]
+        : buildContinueMessages(currentLines, lastTruncated);
+
+    let text = "";
+    let finishReason = "stop";
+    try {
+      const result = await callAILongWithRetry(
+        messages,
+        onProgress,
+        isContinue ? "接续生成" : "生成说明书"
+      );
+      text = result.text;
+      finishReason = result.finishReason;
+    } catch (e) {
+      // Keep draft so user can resume; rethrow with context
+      persist(false);
+      const msg = e instanceof Error ? e.message : String(e);
+      throw new Error(
+        `说明书生成中断（已保存草稿 ${countNonEmptyLines(allText)} 行文档，可从断点继续）：${msg}`
+      );
+    }
+
+    if (text.trim()) {
+      // Avoid duplicating if model repeats the tail
+      const tail = allText.slice(-200);
+      if (tail && text.startsWith(tail)) {
+        allText += text.slice(tail.length);
+      } else {
+        allText += (allText && !allText.endsWith("\n") && !text.startsWith("\n") ? "\n" : "") + text;
+      }
+      emptyStreak = 0;
+      persist(false);
+    } else {
+      emptyStreak++;
+      onProgress?.(`本轮未返回有效内容 (${emptyStreak}/3)，将重试接续...`);
+      if (emptyStreak >= 3) {
+        persist(false);
+        throw new Error(
+          `连续多轮未获得有效内容（已保存草稿 ${countNonEmptyLines(allText)} 行文档，可从断点继续）`
+        );
+      }
+      // retry same round budget with a stronger continue prompt next loop
+      continue;
+    }
+
+    const totalLines = countNonEmptyLines(allText);
+    const fr = finishReason.toLowerCase();
+    lastTruncated = fr === "length" || fr === "max_tokens";
+
+    onProgress?.(
+      `本轮完成，累计 ${totalLines} 行文档 / 目标 ${MIN_LINES} 行${lastTruncated ? "（因长度截断，将自动接续）" : ""}`
+    );
+
+    if (totalLines >= MIN_LINES) break;
+  }
+
   if (!allText.trim()) throw new Error("AI 未返回任何内容");
+
+  const finalLines = countNonEmptyLines(allText);
+  if (opts.projectId) {
+    if (finalLines >= MIN_LINES) {
+      clearManualDraft(opts.projectId);
+    } else {
+      persist(false);
+    }
+  }
+
+  if (finalLines < Math.min(400, MIN_LINES / 2)) {
+    throw new Error(
+      `说明书过短（仅 ${finalLines} 行文档），已保存草稿，请点击“从断点继续”重试`
+    );
+  }
+
   return allText;
 }

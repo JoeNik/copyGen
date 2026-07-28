@@ -5,7 +5,8 @@ import Link from "next/link";
 import { useSession, signIn, signOut } from "next-auth/react";
 import { SessionProvider } from "next-auth/react";
 import { useState } from "react";
-import { getAIKey, setAIKey, getAIProtocol, setAIProtocol, getAIBaseUrl, setAIBaseUrl, getAIModel, setAIModel, AI_DEFAULTS, type AIProtocol, hasAgreed, setAgreed } from "@/lib/storage";
+import { getAIKey, hasAgreed, setAgreed } from "@/lib/storage";
+import AISettingsModal from "@/components/AISettingsModal";
 
 function Logo({ size = 32 }: { size?: number }) {
   return (
@@ -54,26 +55,7 @@ function LandingContent() {
   const [showAgreement, setShowAgreement] = useState(false);
   const [agreed, setAgreedState] = useState(hasAgreed());
   const [agreedChecked, setAgreedChecked] = useState(false);
-  const [aiProtocol, setAiProtocolState] = useState<AIProtocol>(getAIProtocol());
-  const [aiKey, setAiKeyState] = useState(getAIKey() || "");
-  const [aiBaseUrl, setAiBaseUrlState] = useState(getAIBaseUrl());
-  const [aiModel, setAiModelState] = useState(getAIModel());
-  const hasAiKey = !!getAIKey();
-  const defaults = AI_DEFAULTS[aiProtocol];
-
-  const handleProtocolChange = (p: AIProtocol) => {
-    setAiProtocolState(p);
-    setAiBaseUrlState(AI_DEFAULTS[p].baseUrl);
-    setAiModelState(AI_DEFAULTS[p].model);
-  };
-
-  const saveSettings = () => {
-    setAIProtocol(aiProtocol);
-    setAIKey(aiKey.trim());
-    setAIBaseUrl(aiBaseUrl.trim() || defaults.baseUrl);
-    setAIModel(aiModel.trim() || defaults.model);
-    setShowSettings(false);
-  };
+  const [aiReady, setAiReady] = useState(() => !!getAIKey());
 
   const handleAgree = () => {
     setAgreed();
@@ -83,7 +65,7 @@ function LandingContent() {
 
   const handleMainAction = () => {
     if (!agreed) { setShowAgreement(true); return; }
-    if (!hasAiKey) { setShowSettings(true); return; }
+    if (!aiReady) { setShowSettings(true); return; }
   };
 
   return (
@@ -135,13 +117,13 @@ function LandingContent() {
           <p className="text-sm text-[var(--color-muted)] max-w-2xl mx-auto mb-10">
             所有数据仅在浏览器本地处理，代码不会上传至任何服务器。
           </p>
-          {session && hasAiKey && agreed ? (
+          {session && aiReady && agreed ? (
             <Link href="/dashboard" className="inline-block px-8 py-3 bg-[var(--color-primary)] hover:bg-[var(--color-primary-hover)] text-white rounded-lg font-medium transition-colors text-base">
               进入控制台
             </Link>
           ) : session ? (
             <button onClick={handleMainAction} className="inline-block px-8 py-3 bg-[var(--color-primary)] hover:bg-[var(--color-primary-hover)] text-white rounded-lg font-medium transition-colors text-base">
-              配置 API Key 开始使用
+              配置 AI 提供商开始使用
             </button>
           ) : (
             <button onClick={() => signIn("github")} className="inline-flex items-center gap-2 px-8 py-3 bg-white text-black rounded-lg font-medium hover:bg-zinc-200 transition-colors text-base">
@@ -209,45 +191,14 @@ function LandingContent() {
         </div>
       )}
 
-      {/* Settings Modal */}
       {showSettings && (
-        <div className="fixed inset-0 bg-black/60 flex items-center justify-center z-50" onClick={() => setShowSettings(false)}>
-          <div className="bg-[var(--color-card)] border border-[var(--color-border)] rounded-xl p-6 w-full max-w-md" onClick={(e) => e.stopPropagation()}>
-            <h2 className="text-lg font-semibold mb-4">配置 AI</h2>
-            <p className="text-xs text-[var(--color-muted)] mb-4">所有配置仅存储在浏览器本地，不会上传至任何服务器。</p>
-            <div className="space-y-4">
-              <div>
-                <label className="block text-sm text-[var(--color-muted)] mb-1">协议</label>
-                <select value={aiProtocol} onChange={(e) => handleProtocolChange(e.target.value as AIProtocol)}
-                  className="w-full px-3 py-2 bg-[var(--color-input-bg)] border border-[var(--color-border)] rounded-lg text-sm focus:outline-none focus:border-[var(--color-primary)]">
-                  <option value="openai">OpenAI</option>
-                  <option value="claude">Claude</option>
-                  <option value="gemini">Gemini</option>
-                </select>
-              </div>
-              <div>
-                <label className="block text-sm text-[var(--color-muted)] mb-1">API Key</label>
-                <input type="password" value={aiKey} onChange={(e) => setAiKeyState(e.target.value)} placeholder={defaults.keyPlaceholder}
-                  className="w-full px-3 py-2 bg-[var(--color-input-bg)] border border-[var(--color-border)] rounded-lg text-sm focus:outline-none focus:border-[var(--color-primary)]" />
-              </div>
-              <div>
-                <label className="block text-sm text-[var(--color-muted)] mb-1">Base URL</label>
-                <input type="text" value={aiBaseUrl} onChange={(e) => setAiBaseUrlState(e.target.value)} placeholder={defaults.baseUrl}
-                  className="w-full px-3 py-2 bg-[var(--color-input-bg)] border border-[var(--color-border)] rounded-lg text-sm focus:outline-none focus:border-[var(--color-primary)]" />
-                <p className="text-xs text-[var(--color-muted)] mt-1">支持自定义域名或代理地址</p>
-              </div>
-              <div>
-                <label className="block text-sm text-[var(--color-muted)] mb-1">模型</label>
-                <input type="text" value={aiModel} onChange={(e) => setAiModelState(e.target.value)} placeholder={defaults.model}
-                  className="w-full px-3 py-2 bg-[var(--color-input-bg)] border border-[var(--color-border)] rounded-lg text-sm focus:outline-none focus:border-[var(--color-primary)]" />
-              </div>
-              <button onClick={saveSettings} disabled={!aiKey.trim()}
-                className="w-full py-2 bg-[var(--color-primary)] hover:bg-[var(--color-primary-hover)] text-white rounded-lg text-sm font-medium transition-colors disabled:opacity-50">
-                保存
-              </button>
-            </div>
-          </div>
-        </div>
+        <AISettingsModal
+          onClose={() => {
+            setAiReady(!!getAIKey());
+            setShowSettings(false);
+          }}
+          onSaved={() => setAiReady(!!getAIKey())}
+        />
       )}
     </div>
   );
