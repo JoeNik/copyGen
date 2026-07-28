@@ -15,6 +15,184 @@ async function proxyFetch(url: string, init: RequestInit): Promise<Response> {
   });
 }
 
+/** Extract text + finish reason from a single OpenAI/Claude/Gemini JSON payload. */
+function extractFromPayload(
+  data: Record<string, unknown>,
+  protocol: AIProtocol
+): { text: string; finishReason: string } {
+  if (protocol === "openai") {
+    const choices = data?.choices as Array<{
+      message?: { content?: string };
+      delta?: { content?: string };
+      text?: string;
+      finish_reason?: string | null;
+    }> | undefined;
+    const choice = choices?.[0];
+    const text =
+      choice?.message?.content ||
+      choice?.delta?.content ||
+      choice?.text ||
+      "";
+    // Stream chunks often have finish_reason: null — treat as continue so a later
+    // real reason (stop/length) can overwrite it in the aggregator.
+    const fr = choice?.finish_reason;
+    const finishReason = fr ? fr : choice?.delta ? "continue" : "stop";
+    return { text, finishReason };
+  }
+
+  if (protocol === "claude") {
+    // Non-stream: content[0].text
+    // Stream message_delta: delta.stop_reason
+    // Stream content_block_delta: delta.text
+    const content = data?.content as Array<{ type?: string; text?: string }> | undefined;
+    if (Array.isArray(content) && content.length > 0) {
+      const text = content
+        .filter((c) => c.type === "text" || typeof c.text === "string")
+        .map((c) => c.text || "")
+        .join("");
+      return {
+        text,
+        finishReason: (data?.stop_reason as string) || "end_turn",
+      };
+    }
+
+    const type = data?.type as string | undefined;
+    if (type === "content_block_delta") {
+      const delta = data?.delta as { type?: string; text?: string } | undefined;
+      return { text: delta?.text || "", finishReason: "continue" };
+    }
+    if (type === "message_delta") {
+      const delta = data?.delta as { stop_reason?: string } | undefined;
+      return { text: "", finishReason: delta?.stop_reason || "end_turn" };
+    }
+    if (type === "message_stop") {
+      return { text: "", finishReason: "end_turn" };
+    }
+    // message_start / content_block_start / ping — ignore
+    return { text: "", finishReason: "continue" };
+  }
+
+  // Gemini
+  const candidates = data?.candidates as Array<{
+    content?: { parts?: Array<{ text?: string }> };
+    finishReason?: string;
+  }> | undefined;
+  const cand = candidates?.[0];
+  const text = cand?.content?.parts?.map((p) => p.text || "").join("") || "";
+  return { text, finishReason: cand?.finishReason || "STOP" };
+}
+
+/**
+ * Parse an AI API response that may be:
+ * - plain JSON object
+ * - SSE stream (`data: {...}` lines, with optional `: heartbeat` comments)
+ * - NDJSON (one JSON object per line)
+ *
+ * Chinese reverse proxies often inject SSE heartbeats even for non-stream
+ * requests, which makes `res.json()` throw:
+ *   Unexpected token ':', ": heartbea"... is not valid JSON
+ */
+async function parseAIResponse(
+  res: Response,
+  protocol: AIProtocol
+): Promise<{ text: string; finishReason: string }> {
+  const raw = await res.text();
+  const trimmed = raw.trim();
+
+  if (!trimmed) {
+    return { text: "", finishReason: "stop" };
+  }
+
+  // Fast path: pure JSON object/array
+  if (trimmed.startsWith("{") || trimmed.startsWith("[")) {
+    try {
+      const data = JSON.parse(trimmed) as Record<string, unknown>;
+      // OpenAI error body
+      if (data.error && typeof data.error === "object") {
+        const err = data.error as { message?: string };
+        throw new Error(err.message || "AI API 返回错误");
+      }
+      return extractFromPayload(data, protocol);
+    } catch (e) {
+      // Fall through to line-based parsing if it wasn't pure JSON
+      // (e.g. JSON followed by more data, or partial)
+      if (e instanceof Error && e.message.includes("AI API")) throw e;
+    }
+  }
+
+  // SSE / NDJSON / heartbeat-polluted body
+  let text = "";
+  let finishReason = "stop";
+  const lines = raw.split(/\r?\n/);
+
+  for (const line of lines) {
+    const s = line.trim();
+    if (!s) continue;
+
+    // SSE comment / heartbeat — e.g. ": heartbeat", ": keep-alive"
+    if (s.startsWith(":")) continue;
+
+    // SSE event name — ignore
+    if (s.startsWith("event:")) continue;
+    if (s.startsWith("id:")) continue;
+    if (s.startsWith("retry:")) continue;
+
+    let payload = s;
+    if (s.startsWith("data:")) {
+      payload = s.slice(5).trim();
+    }
+
+    if (!payload || payload === "[DONE]") {
+      if (payload === "[DONE]") finishReason = finishReason === "continue" ? "stop" : finishReason;
+      continue;
+    }
+
+    // Some proxies wrap as data: data: {...}
+    if (payload.startsWith("data:")) {
+      payload = payload.slice(5).trim();
+    }
+
+    if (!(payload.startsWith("{") || payload.startsWith("["))) continue;
+
+    try {
+      const data = JSON.parse(payload) as Record<string, unknown>;
+      if (data.error && typeof data.error === "object") {
+        const err = data.error as { message?: string };
+        throw new Error(err.message || "AI API 返回错误");
+      }
+      const part = extractFromPayload(data, protocol);
+      if (part.text) text += part.text;
+      if (part.finishReason && part.finishReason !== "continue") {
+        finishReason = part.finishReason;
+      }
+    } catch (e) {
+      if (e instanceof Error && e.message.includes("AI API")) throw e;
+      // skip malformed chunk
+    }
+  }
+
+  // Last resort: try to find a JSON object embedded in the text
+  if (!text) {
+    const match = trimmed.match(/\{[\s\S]*\}/);
+    if (match) {
+      try {
+        const data = JSON.parse(match[0]) as Record<string, unknown>;
+        return extractFromPayload(data, protocol);
+      } catch {
+        /* ignore */
+      }
+    }
+  }
+
+  return { text, finishReason };
+}
+
+function splitSystemMessages(messages: { role: string; content: string }[]) {
+  const system = messages.filter((m) => m.role === "system").map((m) => m.content).join("\n\n");
+  const rest = messages.filter((m) => m.role !== "system");
+  return { system, rest };
+}
+
 async function callAI(messages: { role: string; content: string }[], config: ProviderConfig): Promise<string> {
   let url: string;
   let headers: Record<string, string>;
@@ -25,23 +203,36 @@ async function callAI(messages: { role: string; content: string }[], config: Pro
     headers = { "Content-Type": "application/json", Authorization: `Bearer ${config.apiKey}` };
     body = JSON.stringify({ model: config.model, max_tokens: 200, messages });
   } else if (config.protocol === "claude") {
+    const { system, rest } = splitSystemMessages(messages);
     url = `${config.baseUrl}/v1/messages`;
-    headers = { "Content-Type": "application/json", "x-api-key": config.apiKey, "anthropic-version": "2023-06-01" };
-    body = JSON.stringify({ model: config.model, max_tokens: 200, messages });
+    headers = {
+      "Content-Type": "application/json",
+      "x-api-key": config.apiKey,
+      "anthropic-version": "2023-06-01",
+      "anthropic-dangerous-direct-browser-access": "true",
+    };
+    body = JSON.stringify({
+      model: config.model,
+      max_tokens: 200,
+      ...(system ? { system } : {}),
+      messages: rest,
+    });
   } else {
-    const contents = messages.filter((m) => m.role !== "system").map((m) => ({ role: m.role === "assistant" ? "model" : "user", parts: [{ text: m.content }] }));
+    const contents = messages
+      .filter((m) => m.role !== "system")
+      .map((m) => ({ role: m.role === "assistant" ? "model" : "user", parts: [{ text: m.content }] }));
     url = `${config.baseUrl}/v1beta/models/${config.model}:generateContent?key=${config.apiKey}`;
     headers = { "Content-Type": "application/json" };
     body = JSON.stringify({ contents, generationConfig: { maxOutputTokens: 200 } });
   }
 
   const res = await proxyFetch(url, { method: "POST", headers, body });
-  if (!res.ok) throw new Error(`AI API 错误 (${res.status})`);
-  const data = await res.json();
-
-  if (config.protocol === "openai") return data?.choices?.[0]?.message?.content?.trim() || "";
-  if (config.protocol === "claude") return data?.content?.[0]?.text?.trim() || "";
-  return data?.candidates?.[0]?.content?.parts?.[0]?.text?.trim() || "";
+  if (!res.ok) {
+    const err = await res.text();
+    throw new Error(`AI API 错误 (${res.status}): ${err.slice(0, 200)}`);
+  }
+  const { text } = await parseAIResponse(res, config.protocol);
+  return text.trim();
 }
 
 export async function callAIForText(prompt: string): Promise<string> {
@@ -134,7 +325,8 @@ ${codeSummary}
 
 // ── Long-form AI for manual generation ──
 
-const MAX_TOKENS = 6553600;
+// Keep within common provider limits; continuation loop handles long manuals.
+const MAX_TOKENS = 8192;
 
 export async function callAILong(messages: { role: string; content: string }[]): Promise<{ text: string; finishReason: string }> {
   const config: ProviderConfig = {
@@ -151,25 +343,44 @@ export async function callAILong(messages: { role: string; content: string }[]):
   if (config.protocol === "openai") {
     url = `${config.baseUrl}/v1/chat/completions`;
     headers = { "Content-Type": "application/json", Authorization: `Bearer ${config.apiKey}` };
-    body = JSON.stringify({ model: config.model, max_tokens: MAX_TOKENS, messages });
+    // stream:true is more reliable through reverse proxies that inject heartbeats
+    body = JSON.stringify({ model: config.model, max_tokens: MAX_TOKENS, stream: true, messages });
   } else if (config.protocol === "claude") {
+    const { system, rest } = splitSystemMessages(messages);
     url = `${config.baseUrl}/v1/messages`;
-    headers = { "Content-Type": "application/json", "x-api-key": config.apiKey, "anthropic-version": "2023-06-01" };
-    body = JSON.stringify({ model: config.model, max_tokens: MAX_TOKENS, messages });
+    headers = {
+      "Content-Type": "application/json",
+      "x-api-key": config.apiKey,
+      "anthropic-version": "2023-06-01",
+      "anthropic-dangerous-direct-browser-access": "true",
+    };
+    body = JSON.stringify({
+      model: config.model,
+      max_tokens: MAX_TOKENS,
+      stream: true,
+      ...(system ? { system } : {}),
+      messages: rest,
+    });
   } else {
-    const contents = messages.filter((m) => m.role !== "system").map((m) => ({ role: m.role === "assistant" ? "model" : "user", parts: [{ text: m.content }] }));
-    url = `${config.baseUrl}/v1beta/models/${config.model}:generateContent?key=${config.apiKey}`;
+    const contents = messages
+      .filter((m) => m.role !== "system")
+      .map((m) => ({ role: m.role === "assistant" ? "model" : "user", parts: [{ text: m.content }] }));
+    const systemInstruction = messages.find((m) => m.role === "system")?.content;
+    url = `${config.baseUrl}/v1beta/models/${config.model}:streamGenerateContent?alt=sse&key=${config.apiKey}`;
     headers = { "Content-Type": "application/json" };
-    body = JSON.stringify({ contents, generationConfig: { maxOutputTokens: MAX_TOKENS } });
+    body = JSON.stringify({
+      contents,
+      ...(systemInstruction ? { systemInstruction: { parts: [{ text: systemInstruction }] } } : {}),
+      generationConfig: { maxOutputTokens: MAX_TOKENS },
+    });
   }
 
   const res = await proxyFetch(url, { method: "POST", headers, body });
-  if (!res.ok) { const err = await res.text(); throw new Error(`AI API 错误 (${res.status}): ${err.slice(0, 200)}`); }
-  const data = await res.json();
-
-  if (config.protocol === "openai") return { text: data?.choices?.[0]?.message?.content || "", finishReason: data?.choices?.[0]?.finish_reason || "stop" };
-  if (config.protocol === "claude") return { text: data?.content?.[0]?.text || "", finishReason: data?.stop_reason || "end_turn" };
-  return { text: data?.candidates?.[0]?.content?.parts?.[0]?.text || "", finishReason: data?.candidates?.[0]?.finishReason || "STOP" };
+  if (!res.ok) {
+    const err = await res.text();
+    throw new Error(`AI API 错误 (${res.status}): ${err.slice(0, 200)}`);
+  }
+  return parseAIResponse(res, config.protocol);
 }
 
 export async function generateManualMarkdown(
@@ -238,9 +449,11 @@ ${codeSummary}
     allText += text;
 
     const totalLines = allText.split("\n").filter((l) => l.trim()).length;
-    const truncated = finishReason.toLowerCase() === "length" || finishReason.toLowerCase() === "max_tokens";
+    const fr = finishReason.toLowerCase();
+    const truncated = fr === "length" || fr === "max_tokens";
 
     if (totalLines >= MIN_LINES) break;
+    if (!text.trim() && attempt > 1) break;
 
     // Need more content — continue
     messages.length = 0;
@@ -248,14 +461,14 @@ ${codeSummary}
       messages.push(
         { role: "system", content: systemPrompt },
         { role: "user", content: userPrompt },
-        { role: "assistant", content: allText },
+        { role: "assistant", content: allText.slice(-6000) },
         { role: "user", content: `内容被截断了（当前${totalLines}行，目标${MIN_LINES}行）。请从截断处继续输出大量内容。要求：\n1. 不要重复已有内容\n2. 每个章节都要大幅扩展，每段至少5句话\n3. 第五章每个功能模块要写30行以上\n4. 第六章Q&A要扩充到20条以上\n5. 尽可能多地输出内容，一次至少输出500行` },
       );
     } else {
       messages.push(
         { role: "system", content: systemPrompt },
         { role: "user", content: userPrompt },
-        { role: "assistant", content: allText },
+        { role: "assistant", content: allText.slice(-6000) },
         { role: "user", content: `当前内容只有${totalLines}行，距离目标${MIN_LINES}行还差很多。请大幅扩展内容：\n- 第五章每个功能模块要写详细的子功能说明、操作步骤（每步3-5句话）\n- 第六章扩充到20条Q&A，每条回答至少3句话\n- 第七章列出至少10个错误码及解决方案\n- 每段都要充实，不要一句话带过\n- 一次至少输出500行新内容\n不要重复已有内容，直接从文末继续补充。` },
       );
     }

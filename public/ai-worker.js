@@ -31,14 +31,17 @@ async function handleProxy(request) {
 
     const response = await fetch(targetUrl, fetchOptions);
 
-    // Clone and forward the response
+    // Forward body as-is (including SSE streams / heartbeats).
+    // Do NOT buffer or re-encode — long manual generation relies on streaming.
+    const outHeaders = new Headers(response.headers);
+    outHeaders.set("Access-Control-Allow-Origin", "*");
+    // Prevent intermediary caches from transforming the stream
+    outHeaders.set("Cache-Control", "no-store");
+
     return new Response(response.body, {
       status: response.status,
       statusText: response.statusText,
-      headers: {
-        ...Object.fromEntries(response.headers.entries()),
-        "Access-Control-Allow-Origin": "*",
-      },
+      headers: outHeaders,
     });
   } catch (error) {
     return new Response(

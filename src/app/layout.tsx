@@ -17,7 +17,7 @@ export default function RootLayout({
       <body className="min-h-full flex flex-col">
         {children}
         <Script id="sw-register" strategy="afterInteractive">
-          {`if('serviceWorker' in navigator){navigator.serviceWorker.register('/ai-worker.js')}`}
+          {`if('serviceWorker' in navigator){navigator.serviceWorker.register('/ai-worker.js?v=2')}`}
         </Script>
       </body>
     </html>
