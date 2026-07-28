@@ -33,6 +33,9 @@ function ProjectDetailContent() {
   const [codePdfUrl, setCodePdfUrl] = useState<string | null>(null);
   const [manualPdfUrl, setManualPdfUrl] = useState<string | null>(null);
   const [manualDraft, setManualDraft] = useState<ManualDraft | null>(null);
+  const [manualMarkdown, setManualMarkdown] = useState("");
+  const [editingManual, setEditingManual] = useState(false);
+  const [reexporting, setReexporting] = useState(false);
 
   const accessToken = (session as { accessToken?: string })?.accessToken;
 
@@ -52,6 +55,7 @@ function ProjectDetailContent() {
       setProject(p);
       setMeta(p.meta);
       setManualDraft(getManualDraft(projectId));
+      if (p.manualMarkdown) setManualMarkdown(p.manualMarkdown);
     };
     void loadProject();
     return () => { active = false; };
@@ -175,25 +179,29 @@ function ProjectDetailContent() {
 
       // Step 3: Generate code PDF (程序鉴别材料)
       setStepIndex(3); setCurrentStep("正在生成程序鉴别材料 PDF..."); setProgress(35);
-      const codePDFBlob = await generateCodePDF(project.softwareName, project.version, files);
+      const codePDFBlob = await generateCodePDF(
+        project.softwareName, project.version, files,
+        (msg) => setCurrentStep(msg)
+      );
 
       // Step 4: Generate manual PDF (文档鉴别材料)
       setStepIndex(4);
       setCurrentStep(
         resumeManual || getManualDraft(projectId)?.markdown
           ? "正在从断点接续生成文档鉴别材料..."
-          : "正在生成文档鉴别材料..."
+          : "正在按章节生成文档鉴别材料..."
       );
       setProgress(50);
 
       const existingDraft = getManualDraft(projectId);
-      const manualMarkdown = await generateManualMarkdown(
+      const generatedMarkdown = await generateManualMarkdown(
         project.softwareName, project.version, meta,
         project.repoUrl, languageStr, fileTree, codeSummary,
         {
           projectId,
           resumeMarkdown: resumeManual || existingDraft?.markdown ? existingDraft?.markdown : undefined,
           resumeAttempt: existingDraft?.attempt,
+          resumeChapterIndex: existingDraft?.nextChapterIndex,
           onProgress: (msg) => {
             setCurrentStep(msg);
             const draft = getManualDraft(projectId);
@@ -201,17 +209,24 @@ function ProjectDetailContent() {
           },
         }
       );
+      setManualMarkdown(generatedMarkdown);
 
       setCurrentStep("正在排版文档鉴别材料 PDF..."); setProgress(70);
       const manualPDFBlob = await generateManualPDF(
-        project.softwareName, project.version, "软件著作权人", manualMarkdown
+        project.softwareName, project.version, "软件著作权人", generatedMarkdown,
+        (msg) => setCurrentStep(msg)
       );
 
       // Step 5: Done
       setStepIndex(5); setCurrentStep("生成完成！"); setProgress(100);
       clearManualDraft(projectId);
       setManualDraft(null);
-      updateProject(projectId, { status: "DONE", meta: { ...meta, sourceLines: totalSourceLines }, errorMsg: undefined });
+      updateProject(projectId, {
+        status: "DONE",
+        meta: { ...meta, sourceLines: totalSourceLines },
+        errorMsg: undefined,
+        manualMarkdown: generatedMarkdown,
+      });
       setProject(getProject(projectId)!);
       setCodePdfUrl(URL.createObjectURL(codePDFBlob));
       setManualPdfUrl(URL.createObjectURL(manualPDFBlob));
@@ -232,6 +247,53 @@ function ProjectDetailContent() {
     link.href = url;
     link.download = filename;
     link.click();
+  };
+
+  const handleDownloadMarkdown = () => {
+    const md = manualMarkdown || project?.manualMarkdown || "";
+    if (!md) return;
+    const blob = new Blob([md], { type: "text/markdown;charset=utf-8" });
+    const url = URL.createObjectURL(blob);
+    handleDownload(url, `${project!.softwareName}_操作说明书.md`);
+    setTimeout(() => URL.revokeObjectURL(url), 1000);
+  };
+
+  const handleSaveManualEdit = () => {
+    if (!project) return;
+    updateProject(projectId, { manualMarkdown });
+    setProject(getProject(projectId)!);
+    setEditingManual(false);
+  };
+
+  const handleReexportManualPDF = async () => {
+    if (!project) return;
+    const md = manualMarkdown || project.manualMarkdown || "";
+    if (!md.trim()) {
+      setError("没有可导出的说明书内容，请先生成或粘贴 Markdown");
+      return;
+    }
+    setReexporting(true);
+    setError("");
+    try {
+      setCurrentStep("正在根据修订稿重新排版 PDF...");
+      const blob = await generateManualPDF(
+        project.softwareName,
+        project.version,
+        "软件著作权人",
+        md,
+        (msg) => setCurrentStep(msg)
+      );
+      if (manualPdfUrl) URL.revokeObjectURL(manualPdfUrl);
+      setManualPdfUrl(URL.createObjectURL(blob));
+      updateProject(projectId, { manualMarkdown: md, status: "DONE", errorMsg: undefined });
+      setProject(getProject(projectId)!);
+      setEditingManual(false);
+      setCurrentStep("PDF 已根据修订内容重新生成");
+    } catch (e) {
+      setError(e instanceof Error ? e.message : "重新导出失败");
+    } finally {
+      setReexporting(false);
+    }
   };
 
   if (!project || !meta) {
@@ -341,16 +403,90 @@ function ProjectDetailContent() {
 
             {/* Download */}
             <div className="grid grid-cols-2 gap-4">
-              <button onClick={() => handleDownload(codePdfUrl, `${project.softwareName}_程序鉴别材料.pdf`)}
-                className="py-3 bg-[var(--color-primary)] hover:bg-[var(--color-primary-hover)] text-white rounded-lg font-medium transition-colors text-center">
-                下载程序鉴别材料
+              <button
+                onClick={() => handleDownload(codePdfUrl, `${project.softwareName}_程序鉴别材料.pdf`)}
+                disabled={!codePdfUrl}
+                className="py-3 bg-[var(--color-primary)] hover:bg-[var(--color-primary-hover)] text-white rounded-lg font-medium transition-colors text-center disabled:opacity-50"
+              >
+                {codePdfUrl ? "下载程序鉴别材料" : "程序 PDF 需重新生成"}
               </button>
-              <button onClick={() => handleDownload(manualPdfUrl, `${project.softwareName}_文档鉴别材料.pdf`)}
-                className="py-3 bg-[var(--color-primary)] hover:bg-[var(--color-primary-hover)] text-white rounded-lg font-medium transition-colors text-center">
-                下载文档鉴别材料
+              <button
+                onClick={() => handleDownload(manualPdfUrl, `${project.softwareName}_文档鉴别材料.pdf`)}
+                disabled={!manualPdfUrl}
+                className="py-3 bg-[var(--color-primary)] hover:bg-[var(--color-primary-hover)] text-white rounded-lg font-medium transition-colors text-center disabled:opacity-50"
+              >
+                {manualPdfUrl ? "下载文档鉴别材料" : "请先重新导出文档 PDF"}
               </button>
             </div>
-            <button onClick={() => { clearManualDraft(projectId); setManualDraft(null); updateProject(projectId, { status: "PENDING" }); setProject(getProject(projectId)!); setMetaReady(false); setCodePdfUrl(null); setManualPdfUrl(null); }}
+            {!codePdfUrl && !manualPdfUrl && (manualMarkdown || project.manualMarkdown) && (
+              <p className="text-xs text-[var(--color-muted)]">
+                刷新页面后内存中的 PDF 会失效。说明书文稿仍保留：可点「重新导出 PDF」恢复文档鉴别材料；程序鉴别材料请点下方「重新生成」。
+              </p>
+            )}
+
+            {/* Editable manual source */}
+            <div className="bg-[var(--color-card)] border border-[var(--color-border)] rounded-xl p-5 space-y-3">
+              <div className="flex items-center justify-between gap-3 flex-wrap">
+                <div>
+                  <h2 className="text-base font-semibold">说明书文稿（可编辑）</h2>
+                  <p className="text-xs text-[var(--color-muted)] mt-1">
+                    PDF 本身不宜直接改字。请在此修订 Markdown，再点「重新导出 PDF」。也可下载 .md 用本地编辑器修改后粘贴回来。
+                  </p>
+                </div>
+                <div className="flex flex-wrap gap-2">
+                  <button
+                    onClick={handleDownloadMarkdown}
+                    className="px-3 py-1.5 text-xs border border-[var(--color-border)] rounded-lg text-[var(--color-muted)] hover:text-[var(--color-foreground)] transition-colors"
+                  >
+                    下载 Markdown
+                  </button>
+                  {!editingManual ? (
+                    <button
+                      onClick={() => {
+                        setManualMarkdown(manualMarkdown || project.manualMarkdown || "");
+                        setEditingManual(true);
+                      }}
+                      className="px-3 py-1.5 text-xs border border-[var(--color-border)] rounded-lg hover:border-[var(--color-primary)] transition-colors"
+                    >
+                      编辑文稿
+                    </button>
+                  ) : (
+                    <button
+                      onClick={handleSaveManualEdit}
+                      className="px-3 py-1.5 text-xs border border-[var(--color-border)] rounded-lg hover:border-[var(--color-primary)] transition-colors"
+                    >
+                      保存文稿
+                    </button>
+                  )}
+                  <button
+                    onClick={handleReexportManualPDF}
+                    disabled={reexporting || !(manualMarkdown || project.manualMarkdown)}
+                    className="px-3 py-1.5 text-xs bg-[var(--color-primary)] hover:bg-[var(--color-primary-hover)] text-white rounded-lg transition-colors disabled:opacity-50"
+                  >
+                    {reexporting ? "导出中..." : "重新导出 PDF"}
+                  </button>
+                </div>
+              </div>
+              {editingManual ? (
+                <textarea
+                  value={manualMarkdown}
+                  onChange={(e) => setManualMarkdown(e.target.value)}
+                  rows={18}
+                  className="w-full px-3 py-2 bg-[var(--color-input-bg)] border border-[var(--color-border)] rounded-lg text-xs font-mono leading-relaxed focus:outline-none focus:border-[var(--color-primary)]"
+                  placeholder="说明书 Markdown..."
+                />
+              ) : (
+                <pre className="max-h-64 overflow-auto text-xs text-[var(--color-muted)] whitespace-pre-wrap bg-black/20 rounded-lg p-3 border border-[var(--color-border)]">
+                  {(manualMarkdown || project.manualMarkdown || "（暂无文稿，请重新生成）").slice(0, 4000)}
+                  {(manualMarkdown || project.manualMarkdown || "").length > 4000 ? "\n…（已截断预览，点编辑可查看全文）" : ""}
+                </pre>
+              )}
+              {currentStep && reexporting && (
+                <p className="text-xs text-[var(--color-primary)]">{currentStep}</p>
+              )}
+            </div>
+
+            <button onClick={() => { clearManualDraft(projectId); setManualDraft(null); updateProject(projectId, { status: "PENDING" }); setProject(getProject(projectId)!); setMetaReady(false); setCodePdfUrl(null); setManualPdfUrl(null); setManualMarkdown(""); }}
                 className="px-6 py-3 border border-[var(--color-border)] rounded-lg text-sm text-[var(--color-muted)] hover:text-[var(--color-foreground)] hover:border-[var(--color-muted)] transition-colors">重新生成</button>
 
             {/* Registration form reference */}

@@ -460,14 +460,70 @@ export interface GenerateManualOptions {
   resumeMarkdown?: string;
   /** Starting attempt counter when resuming */
   resumeAttempt?: number;
+  /** Resume from this chapter index (0-based) */
+  resumeChapterIndex?: number;
   onProgress?: (msg: string) => void;
   /**
-   * Target non-empty Markdown lines for 文档鉴别材料.
-   * This is NOT source-code line count (源程序约 3000–6000 行是另一回事).
-   * Soft copyright manuals are usually deposited as ~60 pages; ~1500–2000
-   * non-empty doc lines is enough to paginate into that range.
+   * Soft target for total non-empty doc lines across all chapters.
+   * NOT source-code line count.
    */
   minLines?: number;
+}
+
+const MANUAL_CHAPTERS: Array<{ title: string; outline: string; minLines: number }> = [
+  {
+    title: "第一章 软件概述",
+    outline: "编写背景与建设意义、目标用户与使用场景、核心功能列表、总体技术架构、术语表、版本历史概览",
+    minLines: 180,
+  },
+  {
+    title: "第二章 运行环境",
+    outline: "硬件要求（CPU/内存/磁盘/显示器）、支持的操作系统、软件依赖与运行时、网络与端口、权限与安全要求、推荐配置与最低配置对照表",
+    minLines: 160,
+  },
+  {
+    title: "第三章 软件安装与卸载",
+    outline: "安装前准备、Windows 安装步骤、Linux 安装步骤、macOS 安装步骤、Docker/容器部署、环境变量与配置文件、升级安装、完整卸载步骤、安装验证",
+    minLines: 200,
+  },
+  {
+    title: "第四章 快速入门",
+    outline: "首次启动、注册/登录（如有）、主界面分区说明、常用入口与导航、第一个完整操作示例、快捷键与基础设置",
+    minLines: 180,
+  },
+  {
+    title: "第五章 功能模块详细说明",
+    outline: "至少 8 个功能模块；每个模块含：功能说明、前置条件、界面说明、逐步操作（步骤1/2/3…）、结果确认、注意事项、[图X-X：描述] 占位",
+    minLines: 350,
+  },
+  {
+    title: "第六章 常见问题与解答",
+    outline: "至少 20 条 Q&A，覆盖安装、登录、配置、性能、兼容性、数据、权限、网络；每条回答至少 3 句话",
+    minLines: 220,
+  },
+  {
+    title: "第七章 错误代码与处理方法",
+    outline: "至少 12 个错误码表：错误码、含义、可能原因、处理步骤、预防建议",
+    minLines: 160,
+  },
+  {
+    title: "第八章 版本更新说明",
+    outline: "版本号规则、历史版本更新摘要、升级注意事项、回滚建议、维护与技术支持说明",
+    minLines: 120,
+  },
+];
+
+function stripModelFences(text: string): string {
+  return text
+    .replace(/^```(?:markdown|md)?\s*/i, "")
+    .replace(/\s*```$/i, "")
+    .trim();
+}
+
+function chapterAlreadyPresent(allText: string, title: string): boolean {
+  const bare = title.replace(/^第[一二三四五六七八九十\d]+章\s*/, "").trim();
+  const re = new RegExp(`^#\\s+.*${bare.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}`, "m");
+  return re.test(allText) || allText.includes(`# ${title}`);
 }
 
 export async function generateManualMarkdown(
@@ -486,195 +542,233 @@ export async function generateManualMarkdown(
       : onProgressOrOpts || {};
 
   const onProgress = opts.onProgress;
-  // 文档鉴别材料目标行数（说明书 Markdown），与源程序 6000 行无关
-  const MIN_LINES = opts.minLines ?? 2000;
-  const MAX_ROUNDS = 20;
-  const PERSIST_EVERY = true;
-
   const { saveManualDraft, clearManualDraft, getManualDraft } = await import("@/lib/storage");
 
-  const systemPrompt =
-    "你是一名专业的软件著作权申报文档撰写专家。请直接输出完整的 Markdown 文档，不要输出 JSON。每章内容要极其详实，每个功能点都要展开详细的步骤说明，每段至少5句话。";
-
-  const userPrompt = `请生成《${softwareName}》的完整操作说明书（Markdown 格式）。
-说明：这里的“行数”指说明书文档行数，用于排版成文档鉴别材料 PDF（一般交存前后各约 30 页），不是源程序代码行数。
-
-软件信息：
+  const contextBlock = `软件信息：
 - 名称：${softwareName} ${version}
-- 用途：${meta.purpose}
-- 领域：${meta.domain}
-- 主要功能：${meta.mainFeatures}
-- 技术特点：${meta.technicalFeatures}
-- 运行平台：${meta.runPlatform}
-- 运行环境：${meta.runSupport}
-- 编程语言：${languages}
-- 仓库描述：${repoDescription}
+- 用途：${meta.purpose || "未填写"}
+- 领域：${meta.domain || "通用"}
+- 主要功能：${meta.mainFeatures || "见代码结构"}
+- 技术特点：${meta.technicalFeatures || "见代码摘要"}
+- 运行平台：${meta.runPlatform || "跨平台"}
+- 运行环境：${meta.runSupport || "见依赖"}
+- 编程语言：${languages || "未知"}
+- 仓库描述：${repoDescription || "无"}
 
-代码结构（前50个文件）：
-${fileTree}
+代码结构（节选）：
+${fileTree.slice(0, 2500)}
 
-代码摘要：
-${codeSummary}
+代码摘要（节选）：
+${codeSummary.slice(0, 3000)}`;
 
-章节要求（每章必须内容充实，不少于 150 行）：
-# 第一章 软件概述（背景、目标用户分析、核心功能列表、技术架构概述、版本历史）
-# 第二章 运行环境（硬件要求详细说明、软件依赖列表、网络要求、安全要求）
-# 第三章 软件安装与卸载（Windows安装、Linux安装、macOS安装、Docker部署、卸载步骤）
-# 第四章 快速入门（注册登录、主界面说明、各区域功能、快捷操作）
-# 第五章 功能模块详细说明（每个功能点都要有详细的步骤1、步骤2...格式，至少覆盖8个功能模块，每个模块不少于30行）
-# 第六章 常见问题与解答（至少20条 Q&A，涵盖安装、使用、配置、故障排除等方面）
-# 第七章 错误代码与处理方法（列出常见错误码、原因、解决方案）
-# 第八章 版本更新说明（版本历史、更新内容、升级指南）
+  const systemPrompt = `你是中国软件著作权「文档鉴别材料/操作说明书」撰写专家。
+规则：
+1. 只输出 Markdown 正文，不要输出目录，不要输出 JSON，不要用代码围栏包裹全文
+2. 使用正式中文说明文风，内容具体可操作，避免空话套话
+3. 一级标题必须使用给定的章节标题（以 # 开头）
+4. 可用 ## / ### 作为小节；图片用 [图章号-序号：描述] 占位
+5. 本请求只写当前这一章，不要写其他章，不要重复已写章节
+6. 一次尽量写完整、详实（目标约 200–400 行文档），不要只写一两百字就结束`;
 
-要求：
-- 使用正式的中文公文写作风格
-- 每段落不少于5句话，内容要详实具体
-- 图片位置用 [图X-X：描述] 占位符标注
-- 目标总行数 ${MIN_LINES} 行以上（说明书文档行，非代码行）
-- 只输出 Markdown，不要输出其他说明`;
-
-  // Resume from explicit arg or saved draft
   let allText = opts.resumeMarkdown || "";
+  let startChapter = opts.resumeChapterIndex ?? 0;
   let attempt = opts.resumeAttempt || 0;
-  let emptyStreak = 0;
-  let lastTruncated = false;
 
   if (!allText && opts.projectId) {
     const draft = getManualDraft(opts.projectId);
     if (draft?.markdown && !draft.complete) {
       allText = draft.markdown;
+      startChapter = draft.nextChapterIndex ?? 0;
       attempt = draft.attempt || 0;
       onProgress?.(
-        `发现未完成的说明书草稿（${draft.lines || countNonEmptyLines(allText)} 行），从断点继续...`
+        `发现未完成说明书草稿（${draft.lines || countNonEmptyLines(allText)} 行，第 ${startChapter + 1}/${MANUAL_CHAPTERS.length} 章起续写）...`
       );
     }
   }
 
-  const persist = (complete = false) => {
-    if (!opts.projectId || !PERSIST_EVERY) return;
-    const lines = countNonEmptyLines(allText);
+  // If resuming mid-doc without chapter index, infer next chapter
+  if (allText && (opts.resumeChapterIndex == null)) {
+    let inferred = 0;
+    for (let i = 0; i < MANUAL_CHAPTERS.length; i++) {
+      if (chapterAlreadyPresent(allText, MANUAL_CHAPTERS[i].title)) inferred = i + 1;
+    }
+    startChapter = Math.max(startChapter, Math.min(inferred, MANUAL_CHAPTERS.length));
+  }
+
+  const persist = (nextChapterIndex: number, complete = false) => {
+    if (!opts.projectId) return;
     if (!allText.trim()) return;
     saveManualDraft({
       projectId: opts.projectId,
       softwareName,
       version,
       markdown: allText,
-      lines,
+      lines: countNonEmptyLines(allText),
       attempt,
       updatedAt: new Date().toISOString(),
       complete,
+      nextChapterIndex,
     });
   };
 
-  const buildContinueMessages = (totalLines: number, truncated: boolean) => {
-    const tail = allText.slice(-8000);
-    if (truncated) {
-      return [
-        { role: "system", content: systemPrompt },
-        { role: "user", content: userPrompt },
-        { role: "assistant", content: tail },
-        {
-          role: "user",
-          content: `内容被截断了（当前说明书 ${totalLines} 行，目标 ${MIN_LINES} 行文档行）。请紧接着上文末尾继续写，不要重复已有章节标题和段落。尽量一次输出 400 行以上新内容。`,
-        },
-      ];
-    }
-    return [
-      { role: "system", content: systemPrompt },
-      { role: "user", content: userPrompt },
-      { role: "assistant", content: tail },
-      {
-        role: "user",
-        content: `当前说明书只有 ${totalLines} 行（文档行，非代码行），目标 ${MIN_LINES} 行。请从文末继续大幅扩充，不要重复已有内容：\n- 补全尚未写完的章节\n- 第五章每个功能模块写清操作步骤\n- 第六章扩到 20 条以上 Q&A\n- 第七章至少 10 个错误码\n一次至少输出 400 行新内容。`,
-      },
-    ];
-  };
-
-  while (attempt < MAX_ROUNDS) {
-    attempt++;
-    const currentLines = countNonEmptyLines(allText);
-    const isContinue = currentLines > 0;
-    onProgress?.(
-      `正在${isContinue ? "接续" : ""}生成说明书... (第 ${attempt} 轮, 已 ${currentLines} 行文档 / 目标 ${MIN_LINES} 行)`
-    );
-
-    const messages =
-      currentLines === 0
-        ? [
-            { role: "system", content: systemPrompt },
-            { role: "user", content: userPrompt },
-          ]
-        : buildContinueMessages(currentLines, lastTruncated);
-
-    let text = "";
-    let finishReason = "stop";
-    try {
-      const result = await callAILongWithRetry(
-        messages,
-        onProgress,
-        isContinue ? "接续生成" : "生成说明书"
-      );
-      text = result.text;
-      finishReason = result.finishReason;
-    } catch (e) {
-      // Keep draft so user can resume; rethrow with context
-      persist(false);
-      const msg = e instanceof Error ? e.message : String(e);
-      throw new Error(
-        `说明书生成中断（已保存草稿 ${countNonEmptyLines(allText)} 行文档，可从断点继续）：${msg}`
-      );
-    }
-
-    if (text.trim()) {
-      // Avoid duplicating if model repeats the tail
-      const tail = allText.slice(-200);
-      if (tail && text.startsWith(tail)) {
-        allText += text.slice(tail.length);
-      } else {
-        allText += (allText && !allText.endsWith("\n") && !text.startsWith("\n") ? "\n" : "") + text;
-      }
-      emptyStreak = 0;
-      persist(false);
-    } else {
-      emptyStreak++;
-      onProgress?.(`本轮未返回有效内容 (${emptyStreak}/3)，将重试接续...`);
-      if (emptyStreak >= 3) {
-        persist(false);
-        throw new Error(
-          `连续多轮未获得有效内容（已保存草稿 ${countNonEmptyLines(allText)} 行文档，可从断点继续）`
-        );
-      }
-      // retry same round budget with a stronger continue prompt next loop
+  for (let ci = startChapter; ci < MANUAL_CHAPTERS.length; ci++) {
+    const chapter = MANUAL_CHAPTERS[ci];
+    if (chapterAlreadyPresent(allText, chapter.title) && countNonEmptyLines(extractChapter(allText, chapter.title)) >= chapter.minLines * 0.6) {
+      onProgress?.(`第 ${ci + 1}/${MANUAL_CHAPTERS.length} 章已存在且较完整，跳过：${chapter.title}`);
       continue;
     }
 
-    const totalLines = countNonEmptyLines(allText);
-    const fr = finishReason.toLowerCase();
-    lastTruncated = fr === "length" || fr === "max_tokens";
-
     onProgress?.(
-      `本轮完成，累计 ${totalLines} 行文档 / 目标 ${MIN_LINES} 行${lastTruncated ? "（因长度截断，将自动接续）" : ""}`
+      `正在生成 ${chapter.title}（${ci + 1}/${MANUAL_CHAPTERS.length}）... 已累计 ${countNonEmptyLines(allText)} 行文档`
     );
 
-    if (totalLines >= MIN_LINES) break;
+    const userPrompt = `请只撰写以下这一章的完整 Markdown（不要目录、不要其它章）：
+
+# ${chapter.title}
+
+本章应覆盖：${chapter.outline}
+
+${contextBlock}
+
+硬性要求：
+- 首行必须是：# ${chapter.title}
+- 正文不少于约 ${chapter.minLines} 行（非空行），内容详实
+- 每段至少 3–5 句；操作类内容必须有步骤编号
+- 不要输出「目录」
+- 不要重复已经生成过的章节
+- 不要用 \`\`\`markdown 包裹全文`;
+
+    // Allow multi-turn continuation *within the same chapter* if truncated/short
+    let chapterText = "";
+    let innerRound = 0;
+    const MAX_INNER = 4;
+
+    while (innerRound < MAX_INNER) {
+      innerRound++;
+      attempt++;
+      const messages =
+        chapterText.trim().length === 0
+          ? [
+              { role: "system", content: systemPrompt },
+              { role: "user", content: userPrompt },
+            ]
+          : [
+              { role: "system", content: systemPrompt },
+              { role: "user", content: userPrompt },
+              { role: "assistant", content: chapterText.slice(-10000) },
+              {
+                role: "user",
+                content: `本章目前约 ${countNonEmptyLines(chapterText)} 行，目标约 ${chapter.minLines} 行。请紧接上文继续写本章剩余内容，不要重复已写小节，不要开始下一章。`,
+              },
+            ];
+
+      try {
+        const { text, finishReason } = await callAILongWithRetry(
+          messages,
+          onProgress,
+          `${chapter.title}`
+        );
+        const piece = stripModelFences(text);
+        if (!piece.trim()) {
+          onProgress?.(`${chapter.title} 本轮空响应，重试内轮 ${innerRound}/${MAX_INNER}...`);
+          continue;
+        }
+        if (!chapterText) chapterText = piece;
+        else {
+          const tail = chapterText.slice(-180);
+          chapterText += tail && piece.startsWith(tail) ? piece.slice(tail.length) : `\n${piece}`;
+        }
+
+        const lines = countNonEmptyLines(chapterText);
+        const truncated =
+          finishReason.toLowerCase() === "length" ||
+          finishReason.toLowerCase() === "max_tokens";
+        onProgress?.(
+          `${chapter.title} 已写 ${lines} 行${truncated ? "（截断，继续本分章）" : ""}`
+        );
+        if (!truncated && lines >= chapter.minLines * 0.75) break;
+        if (!truncated && lines >= 80 && innerRound >= 2) break;
+      } catch (e) {
+        // Save progress including partial chapter
+        const partial = [allText, chapterText].filter(Boolean).join("\n\n").trim();
+        allText = partial;
+        persist(ci, false);
+        const msg = e instanceof Error ? e.message : String(e);
+        throw new Error(
+          `说明书生成中断于「${chapter.title}」（已保存草稿 ${countNonEmptyLines(allText)} 行，可从断点继续）：${msg}`
+        );
+      }
+    }
+
+    if (!chapterText.trim()) {
+      persist(ci, false);
+      throw new Error(`「${chapter.title}」未生成有效内容（已保存草稿，可从断点继续）`);
+    }
+
+    // Ensure chapter heading exists once
+    if (!/^#\s+/.test(chapterText.trim())) {
+      chapterText = `# ${chapter.title}\n\n${chapterText}`;
+    }
+
+    allText = [allText.trim(), chapterText.trim()].filter(Boolean).join("\n\n") + "\n\n";
+    persist(ci + 1, false);
+    onProgress?.(
+      `完成 ${chapter.title} · 累计 ${countNonEmptyLines(allText)} 行文档（${ci + 1}/${MANUAL_CHAPTERS.length}）`
+    );
   }
 
   if (!allText.trim()) throw new Error("AI 未返回任何内容");
 
-  const finalLines = countNonEmptyLines(allText);
-  if (opts.projectId) {
-    if (finalLines >= MIN_LINES) {
-      clearManualDraft(opts.projectId);
-    } else {
-      persist(false);
+  // Light global top-up only if still extremely short (should be rare with chapter mode)
+  const total = countNonEmptyLines(allText);
+  const softTarget = opts.minLines ?? 1500;
+  if (total < softTarget * 0.5) {
+    onProgress?.(`总行数偏少（${total}），尝试补充第五章细节...`);
+    try {
+      const { text } = await callAILongWithRetry(
+        [
+          { role: "system", content: systemPrompt },
+          {
+            role: "user",
+            content: `在不重复已有章节标题的前提下，为《${softwareName}》补充「功能模块」操作细节（Markdown）。\n\n已有文末：\n${allText.slice(-5000)}\n\n请输出补充内容（## 小节即可），约 300 行。`,
+          },
+        ],
+        onProgress,
+        "补充内容"
+      );
+      const extra = stripModelFences(text);
+      if (extra.trim()) allText += `\n\n${extra}\n`;
+    } catch {
+      /* keep what we have */
     }
   }
 
-  if (finalLines < Math.min(400, MIN_LINES / 2)) {
-    throw new Error(
-      `说明书过短（仅 ${finalLines} 行文档），已保存草稿，请点击“从断点继续”重试`
-    );
+  if (opts.projectId) {
+    clearManualDraft(opts.projectId);
   }
 
-  return allText;
+  return allText.trim() + "\n";
+}
+
+function extractChapter(allText: string, title: string): string {
+  const bare = title.replace(/^第[一二三四五六七八九十\d]+章\s*/, "").trim();
+  const lines = allText.split("\n");
+  let start = -1;
+  for (let i = 0; i < lines.length; i++) {
+    const t = lines[i].trim();
+    if (/^#\s+/.test(t) && !/^##\s+/.test(t) && (t.includes(bare) || t.includes(title))) {
+      start = i;
+      break;
+    }
+  }
+  if (start < 0) return "";
+  let end = lines.length;
+  for (let i = start + 1; i < lines.length; i++) {
+    const t = lines[i].trim();
+    if (/^#\s+/.test(t) && !/^##\s+/.test(t)) {
+      end = i;
+      break;
+    }
+  }
+  return lines.slice(start, end).join("\n");
 }

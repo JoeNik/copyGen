@@ -471,6 +471,8 @@ export interface ManualDraft {
   updatedAt: string;
   /** true when target line count was reached */
   complete?: boolean;
+  /** chapter index for chapter-wise generation resume (0-based) */
+  nextChapterIndex?: number;
 }
 
 function draftKey(projectId: string) {
@@ -551,6 +553,8 @@ export interface Project {
   meta: SoftwareMeta;
   errorMsg?: string;
   createdAt: string;
+  /** Editable 文档鉴别材料 markdown (persisted after generation) */
+  manualMarkdown?: string;
 }
 
 function generateId(): string {
