@@ -30,6 +30,12 @@ function markGenerationInterrupted(projectId: string): { project: Project; draft
   return { project: updated, draft, message };
 }
 
+function describeManualDraftResume(draft: ManualDraft): string {
+  const nextChapter = draft.nextChapterIndex == null ? null : draft.nextChapterIndex + 1;
+  const chapterText = nextChapter ? `，将从第 ${nextChapter} 章起继续` : "";
+  return `已保存 ${draft.lines || 0} 行文档草稿${chapterText}，更新时间 ${new Date(draft.updatedAt).toLocaleString("zh-CN")}。`;
+}
+
 function ProjectDetailContent() {
   const { data: session, status } = useSession();
   const router = useRouter();
@@ -87,6 +93,14 @@ function ProjectDetailContent() {
         if (recovered) {
           setProject(recovered.project);
           setMeta(recovered.project.meta);
+          setBranches([]);
+          setBranchesLoadAttempted(false);
+          setProjectDraft({
+            softwareName: recovered.project.softwareName,
+            version: recovered.project.version,
+            completedAt: recovered.project.completedAt || "",
+            branch: recovered.project.defaultBranch,
+          });
           setManualDraft(recovered.draft);
           if (recovered.project.manualMarkdown) setManualMarkdown(recovered.project.manualMarkdown);
           setError(recovered.message);
@@ -497,6 +511,39 @@ function ProjectDetailContent() {
           </div>
         )}
 
+        {project.status === "FAILED" && manualDraft?.markdown && !generating && (
+          <div className="bg-[var(--color-primary)]/10 border border-[var(--color-primary)]/30 rounded-xl p-5 mb-6">
+            <div className="flex items-start justify-between gap-4 flex-wrap">
+              <div className="min-w-0">
+                <h2 className="text-base font-semibold mb-1">发现可恢复的说明书草稿</h2>
+                <p className="text-sm text-[var(--color-muted)] whitespace-pre-wrap">
+                  {project.errorMsg || error || "上次生成未正常完成。"}
+                </p>
+                <p className="text-xs text-[var(--color-muted)] mt-2">
+                  {describeManualDraftResume(manualDraft)}
+                </p>
+                <p className="text-xs text-[var(--color-muted)] mt-1">
+                  中断通常发生在刷新/关闭页面、路由切换、浏览器终止任务，或 AI 接口长时间无响应时。
+                </p>
+              </div>
+              <div className="flex flex-wrap gap-2">
+                <button
+                  onClick={() => startGenerate({ resumeManual: true })}
+                  className="px-4 py-2 text-sm bg-[var(--color-primary)] hover:bg-[var(--color-primary-hover)] text-white rounded-lg transition-colors"
+                >
+                  从断点继续
+                </button>
+                <button
+                  onClick={() => startGenerate({ freshManual: true })}
+                  className="px-4 py-2 text-sm border border-[var(--color-border)] rounded-lg text-[var(--color-muted)] hover:text-[var(--color-foreground)] hover:border-[var(--color-muted)] transition-colors"
+                >
+                  放弃草稿，重新开始
+                </button>
+              </div>
+            </div>
+          </div>
+        )}
+
         {!generating && project.status !== "PROCESSING" && (
           <div className="bg-[var(--color-card)] border border-[var(--color-border)] rounded-xl p-5 mb-6">
             <div className="flex items-start justify-between gap-4">
@@ -846,11 +893,7 @@ function ProjectDetailContent() {
               <p className="text-sm text-[var(--color-muted)] whitespace-pre-wrap">{project.errorMsg || error || "未知错误，请重试。"}</p>
               {manualDraft?.markdown && (
                 <div className="mt-4 rounded-lg border border-[var(--color-primary)]/30 bg-[var(--color-primary)]/10 px-3 py-2 text-sm">
-                  已保存说明书草稿：
-                  <span className="font-medium ml-1">{manualDraft.lines || 0} 行文档</span>
-                  <span className="text-[var(--color-muted)] text-xs ml-2">
-                    更新于 {new Date(manualDraft.updatedAt).toLocaleString("zh-CN")}
-                  </span>
+                  {describeManualDraftResume(manualDraft)}
                   <p className="text-xs text-[var(--color-muted)] mt-1">
                     可从断点继续，不必整份重写。程序鉴别材料仍会重新排版生成。
                   </p>
