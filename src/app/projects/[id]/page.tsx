@@ -9,7 +9,7 @@ import { useEffect, useState, useCallback, useRef } from "react";
 import Link from "next/link";
 import { getProject, updateProject, getAIKey, getManualDraft, clearManualDraft, type Project, type SoftwareMeta, type ManualDraft } from "@/lib/storage";
 import { fetchRepoFiles, fetchRepoStats } from "@/lib/github";
-import { generateManualMarkdown, callAIForText, buildMetadataPrompt } from "@/lib/ai-helpers";
+import { generateManualMarkdown, callAIForText, buildMetadataPrompt, sanitizeSoftCopyrightText } from "@/lib/ai-helpers";
 import { generateCodePDF } from "@/lib/docgen/code-pdf";
 import { generateManualPDF } from "@/lib/docgen/manual-pdf";
 import { parseUserAgent, detectDevTools } from "@/lib/utils";
@@ -129,10 +129,16 @@ function ProjectDetailContent() {
         devOS: os,
       } : prev);
 
+      if (!project.defaultBranch.trim()) {
+        setError("项目未指定代码分支，请重新创建项目并选择分支");
+        setMetaReady(true);
+        return;
+      }
+
       try {
         // Lightweight: only fetch tree, no file content
         const { allFilePaths, languages, estimatedLines } = await fetchRepoStats(
-          accessToken, project.repoOwner, project.repoName, project.defaultBranch || "main"
+          accessToken, project.repoOwner, project.repoName, project.defaultBranch
         );
 
         const devTools = detectDevTools(allFilePaths);
@@ -177,12 +183,12 @@ function ProjectDetailContent() {
             const parsed = JSON.parse(match[0]);
             setMeta((prev) => prev ? {
               ...prev,
-              runPlatform: parsed.runPlatform || prev.runPlatform,
-              runSupport: parsed.runSupport || prev.runSupport,
-              purpose: parsed.purpose || prev.purpose,
-              domain: parsed.domain || prev.domain,
-              mainFeatures: parsed.mainFeatures || prev.mainFeatures,
-              technicalFeatures: parsed.technicalFeatures || prev.technicalFeatures,
+              runPlatform: typeof parsed.runPlatform === "string" ? sanitizeSoftCopyrightText(parsed.runPlatform) : prev.runPlatform,
+              runSupport: typeof parsed.runSupport === "string" ? sanitizeSoftCopyrightText(parsed.runSupport) : prev.runSupport,
+              purpose: typeof parsed.purpose === "string" ? sanitizeSoftCopyrightText(parsed.purpose) : prev.purpose,
+              domain: typeof parsed.domain === "string" ? sanitizeSoftCopyrightText(parsed.domain) : prev.domain,
+              mainFeatures: typeof parsed.mainFeatures === "string" ? sanitizeSoftCopyrightText(parsed.mainFeatures) : prev.mainFeatures,
+              technicalFeatures: typeof parsed.technicalFeatures === "string" ? sanitizeSoftCopyrightText(parsed.technicalFeatures) : prev.technicalFeatures,
             } : prev);
           }
         } catch { /* AI response not JSON, skip */ }
@@ -200,6 +206,10 @@ function ProjectDetailContent() {
 
   const startGenerate = useCallback(async (opts?: { resumeManual?: boolean; freshManual?: boolean }) => {
     if (!project || !accessToken || !meta) return;
+    if (!project.defaultBranch.trim()) {
+      setError("项目未指定代码分支，请重新创建项目并选择分支");
+      return;
+    }
 
     const resumeManual = !!opts?.resumeManual;
     if (opts?.freshManual) {
@@ -217,7 +227,7 @@ function ProjectDetailContent() {
       // Step 0: Fetch files
       setStepIndex(0); setCurrentStep("正在读取仓库代码..."); setProgress(5);
       const { files, languages: langExts } = await fetchRepoFiles(
-        accessToken, project.repoOwner, project.repoName, project.defaultBranch || "main",
+        accessToken, project.repoOwner, project.repoName, project.defaultBranch,
         (msg, pct) => { setCurrentStep(msg); setProgress(pct); }
       );
 
@@ -331,16 +341,18 @@ function ProjectDetailContent() {
     setError("");
     try {
       setCurrentStep("正在根据修订稿重新排版 PDF...");
+      const sanitizedMd = sanitizeSoftCopyrightText(md);
       const blob = await generateManualPDF(
         project.softwareName,
         project.version,
         "软件著作权人",
-        md,
+        sanitizedMd,
         (msg) => setCurrentStep(msg)
       );
       if (manualPdfUrl) URL.revokeObjectURL(manualPdfUrl);
       setManualPdfUrl(URL.createObjectURL(blob));
-      updateProject(projectId, { manualMarkdown: md, status: "DONE", errorMsg: undefined });
+      setManualMarkdown(sanitizedMd);
+      updateProject(projectId, { manualMarkdown: sanitizedMd, status: "DONE", errorMsg: undefined });
       setProject(getProject(projectId)!);
       setEditingManual(false);
       setCurrentStep("PDF 已根据修订内容重新生成");
@@ -370,7 +382,7 @@ function ProjectDetailContent() {
       <main className="flex-1 max-w-4xl mx-auto w-full px-6 py-8">
         <div className="mb-8">
           <h1 className="text-2xl font-bold mb-2">{project.softwareName}</h1>
-          <p className="text-sm text-[var(--color-muted)]">{project.repoOwner}/{project.repoName} · {project.version}</p>
+          <p className="text-sm text-[var(--color-muted)]">{project.repoOwner}/{project.repoName} · {project.defaultBranch} · {project.version}</p>
         </div>
 
         {/* Metadata display/edit */}

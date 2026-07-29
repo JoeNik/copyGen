@@ -14,6 +14,10 @@ export interface GitHubRepo {
   default_branch: string;
 }
 
+export interface GitHubBranch {
+  name: string;
+}
+
 interface GitHubFile {
   path: string;
   type: string;
@@ -104,6 +108,15 @@ export async function fetchUserRepos(token: string): Promise<GitHubRepo[]> {
     { headers: { Authorization: `Bearer ${token}` } }
   );
   if (!res.ok) throw new Error("获取仓库列表失败，请检查 Token");
+  return res.json();
+}
+
+export async function fetchRepoBranches(token: string, owner: string, repo: string): Promise<GitHubBranch[]> {
+  const res = await fetch(
+    `https://api.github.com/repos/${owner}/${repo}/branches?per_page=100`,
+    { headers: { Authorization: `Bearer ${token}` } }
+  );
+  if (!res.ok) throw new Error("获取仓库分支列表失败");
   return res.json();
 }
 

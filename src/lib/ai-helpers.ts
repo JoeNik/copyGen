@@ -7,6 +7,50 @@ interface ProviderConfig {
   model: string;
 }
 
+const SOFT_COPYRIGHT_COMPLIANCE_RULES = `软著申报合规用语要求：
+- 申报材料只描述软件功能、技术架构、操作流程和数据管理能力。
+- 涉及信俗、民俗、传统文化、节庆或非遗内容时，统一采用“民俗文化”“传统文化资料”“文化资源展示”“文化活动信息管理”等中性表述。
+- 涉及“妈祖信俗”“妈祖祭典”时，按非物质文化遗产、社会实践、仪式、节庆活动和民俗文化资料处理；可写“妈祖信俗文化”“妈祖民俗文化资料”“妈祖文化活动信息管理”，不得写成“妈祖宗教文化”“妈祖宗教活动”“互联网宗教信息服务”。
+- 不得写成互联网宗教信息服务、宗教活动组织、传教、宗教教育培训、讲经讲道、宗教仪式直播/录播、发展信徒、宗教募捐或宗教商业宣传。
+- 不得宣称祈福改运、消灾解厄、灵验、开光加持、算命占卜等功效；不要引导用户参与宗教仪式或购买宗教服务。`;
+
+const SOFT_COPYRIGHT_TERM_REPLACEMENTS: Array<[RegExp, string]> = [
+  [/妈祖宗教信仰文化/g, "妈祖信俗文化"],
+  [/妈祖宗教文化/g, "妈祖信俗文化"],
+  [/妈祖信仰文化/g, "妈祖信俗文化"],
+  [/妈祖宗教活动/g, "妈祖民俗文化活动"],
+  [/妈祖宗教仪式/g, "妈祖民俗仪式"],
+  [/妈祖宗教信息服务/g, "妈祖信俗文化资料服务"],
+  [/妈祖信仰服务/g, "妈祖信俗文化服务"],
+  [/妈祖信仰/g, "妈祖信俗"],
+  [/宗教信仰文化/g, "民俗文化"],
+  [/信仰文化/g, "民俗文化"],
+  [/宗教文化传播/g, "传统文化资料展示"],
+  [/传教/g, "文化资料展示"],
+  [/讲经讲道/g, "文化资料讲解"],
+  [/宗教教育培训/g, "文化知识学习"],
+  [/宗教活动组织/g, "文化活动信息管理"],
+  [/宗教仪式直播/g, "文化活动影像展示"],
+  [/宗教仪式录播/g, "文化活动影像展示"],
+  [/发展信徒/g, "用户服务"],
+  [/发展教徒/g, "用户服务"],
+  [/宗教募捐/g, "公益信息管理"],
+  [/宗教商业宣传/g, "文化资源介绍"],
+  [/祈福改运/g, "民俗文化体验"],
+  [/消灾解厄/g, "民俗文化体验"],
+  [/开光加持/g, "民俗工艺展示"],
+  [/算命占卜/g, "民俗文化内容展示"],
+  [/灵验/g, "文化特色"],
+];
+
+export function sanitizeSoftCopyrightText(text: string): string {
+  let next = text;
+  for (const [pattern, replacement] of SOFT_COPYRIGHT_TERM_REPLACEMENTS) {
+    next = next.replace(pattern, replacement);
+  }
+  return next;
+}
+
 async function proxyFetch(url: string, init: RequestInit): Promise<Response> {
   return fetch("/__ai_proxy__", {
     method: "POST",
@@ -270,6 +314,7 @@ export function buildAutoNamePrompt(repoName: string, description: string, langu
   return `根据以下 GitHub 仓库信息，生成一个适合中国软件著作权登记的软件全称。
 格式必须为"XXX软件"，以"软件"二字结尾，不要包含版本号。
 只返回软件全称本身，不要返回其他内容。
+${SOFT_COPYRIGHT_COMPLIANCE_RULES}
 
 仓库名称：${repoName}
 仓库描述：${description || "无"}
@@ -323,6 +368,7 @@ export function buildMetadataPrompt(
   codeSummary: string
 ): string {
   return `根据以下 GitHub 仓库信息，返回 JSON 格式的软件元数据。只返回 JSON，不要其他内容。
+${SOFT_COPYRIGHT_COMPLIANCE_RULES}
 
 仓库名称：${repoName}
 仓库描述：${description || "无"}
@@ -568,7 +614,8 @@ ${codeSummary.slice(0, 3000)}`;
 3. 一级标题必须使用给定的章节标题（以 # 开头）
 4. 可用 ## / ### 作为小节；图片用 [图章号-序号：描述] 占位
 5. 本请求只写当前这一章，不要写其他章，不要重复已写章节
-6. 一次尽量写完整、详实（目标约 200–400 行文档），不要只写一两百字就结束`;
+6. 一次尽量写完整、详实（目标约 200–400 行文档），不要只写一两百字就结束
+${SOFT_COPYRIGHT_COMPLIANCE_RULES}`;
 
   let allText = opts.resumeMarkdown || "";
   let startChapter = opts.resumeChapterIndex ?? 0;
@@ -747,7 +794,7 @@ ${contextBlock}
     clearManualDraft(opts.projectId);
   }
 
-  return allText.trim() + "\n";
+  return sanitizeSoftCopyrightText(allText.trim()) + "\n";
 }
 
 function extractChapter(allText: string, title: string): string {

@@ -8,8 +8,8 @@ import { useRouter } from "next/navigation";
 import { useEffect, useState, useMemo, useCallback } from "react";
 import Link from "next/link";
 import { getAIKey, createProject, createEmptyMeta, type SoftwareMeta } from "@/lib/storage";
-import { fetchUserRepos, type GitHubRepo } from "@/lib/github";
-import { callAIForText, buildAutoNamePrompt, buildCategoryPrompt, buildLanguagesPrompt, buildTechCategoriesPrompt } from "@/lib/ai-helpers";
+import { fetchRepoBranches, fetchUserRepos, type GitHubBranch, type GitHubRepo } from "@/lib/github";
+import { callAIForText, buildAutoNamePrompt, buildCategoryPrompt, buildLanguagesPrompt, buildTechCategoriesPrompt, sanitizeSoftCopyrightText } from "@/lib/ai-helpers";
 import { GIVEN_LANGUAGES, GIVEN_TECH_CATEGORIES, SOFTWARE_CATEGORIES, parseUserAgent } from "@/lib/utils";
 
 const PAGE_SIZE = 12;
@@ -22,6 +22,9 @@ function NewProjectContent() {
   const [search, setSearch] = useState("");
   const [page, setPage] = useState(1);
   const [selectedRepo, setSelectedRepo] = useState<GitHubRepo | null>(null);
+  const [branches, setBranches] = useState<GitHubBranch[]>([]);
+  const [selectedBranch, setSelectedBranch] = useState("");
+  const [loadingBranches, setLoadingBranches] = useState(false);
   const [softwareName, setSoftwareName] = useState("");
   const [version, setVersion] = useState("V1.0");
   const [completedAt, setCompletedAt] = useState("");
@@ -63,7 +66,23 @@ function NewProjectContent() {
 
   const handleSelectRepo = useCallback((repo: GitHubRepo) => {
     setSelectedRepo(repo);
+    setBranches([]);
+    setSelectedBranch("");
+    setError("");
     setCompletedAt(repo.pushed_at ? repo.pushed_at.slice(0, 10) : "");
+
+    if (accessToken) {
+      setLoadingBranches(true);
+      fetchRepoBranches(accessToken, repo.owner.login, repo.name)
+        .then((data) => {
+          setBranches(data);
+          setLoadingBranches(false);
+        })
+        .catch((e) => {
+          setError(e instanceof Error ? e.message : "获取仓库分支列表失败，请手动填写分支名");
+          setLoadingBranches(false);
+        });
+    }
 
     const { os, cores, memory } = parseUserAgent();
     setMeta((prev) => ({
@@ -81,7 +100,7 @@ function NewProjectContent() {
     callAIForText(buildAutoNamePrompt(repo.name, repo.description || "", repo.language || ""))
       .then((name) => {
         if (name) {
-          name = name.replace(/^["'""]|["'""]$/g, "").trim();
+          name = sanitizeSoftCopyrightText(name.replace(/^["'""]|["'""]$/g, "").trim());
           if (!name.endsWith("软件")) name += "软件";
           setSoftwareName(name);
         }
@@ -124,7 +143,7 @@ function NewProjectContent() {
         // On AI failure, set a default
         setMeta((prev) => ({ ...prev, techCategoriesGiven: ["APP"] }));
       });
-  }, []);
+  }, [accessToken]);
 
   const toggleLanguage = (lang: string) => {
     setMeta((prev) => ({
@@ -145,13 +164,13 @@ function NewProjectContent() {
   };
 
   const handleSubmit = () => {
-    if (!selectedRepo || !softwareName.trim()) return;
+    if (!selectedRepo || !softwareName.trim() || !selectedBranch.trim()) return;
     setSubmitting(true);
     const project = createProject({
       repoOwner: selectedRepo.owner.login,
       repoName: selectedRepo.name,
       repoUrl: selectedRepo.html_url,
-      defaultBranch: selectedRepo.default_branch || "main",
+      defaultBranch: selectedBranch.trim(),
       softwareName: softwareName.trim(),
       version,
       completedAt,
@@ -242,11 +261,42 @@ function NewProjectContent() {
                   <div className="text-sm text-[var(--color-muted)] mb-1">已选择仓库</div>
                   <div className="font-medium">{selectedRepo.full_name}</div>
                 </div>
-                <button onClick={() => setSelectedRepo(null)} className="text-sm text-[var(--color-muted)] hover:text-[var(--color-foreground)] transition-colors">更换</button>
+                <button onClick={() => { setSelectedRepo(null); setSelectedBranch(""); setBranches([]); }} className="text-sm text-[var(--color-muted)] hover:text-[var(--color-foreground)] transition-colors">更换</button>
               </div>
             </div>
 
             <div className="space-y-5">
+              <div>
+                <label className="block text-sm text-[var(--color-muted)] mb-2">代码分支 *</label>
+                {branches.length > 0 ? (
+                  <select
+                    value={selectedBranch}
+                    onChange={(e) => setSelectedBranch(e.target.value)}
+                    disabled={loadingBranches}
+                    className="w-full px-4 py-3 bg-[var(--color-card)] border border-[var(--color-border)] rounded-lg text-sm focus:outline-none focus:border-[var(--color-primary)] disabled:opacity-50"
+                  >
+                    <option value="">请选择用于生成材料的分支</option>
+                    {branches.map((branch) => (
+                      <option key={branch.name} value={branch.name}>
+                        {branch.name}{branch.name === selectedRepo.default_branch ? "（GitHub 默认分支）" : ""}
+                      </option>
+                    ))}
+                  </select>
+                ) : (
+                  <input
+                    type="text"
+                    value={selectedBranch}
+                    onChange={(e) => setSelectedBranch(e.target.value)}
+                    placeholder={loadingBranches ? "正在读取分支列表..." : "请输入用于生成材料的分支名"}
+                    disabled={loadingBranches}
+                    className="w-full px-4 py-3 bg-[var(--color-card)] border border-[var(--color-border)] rounded-lg text-sm focus:outline-none focus:border-[var(--color-primary)] disabled:opacity-50"
+                  />
+                )}
+                <p className="text-xs text-[var(--color-muted)] mt-1">
+                  必须明确指定分支；默认分支仅作为提示，不会自动带入创建。
+                </p>
+              </div>
+
               {/* Software name - auto generated */}
               <div>
                 <label className="block text-sm text-[var(--color-muted)] mb-2">软件全称 *</label>
@@ -310,7 +360,7 @@ function NewProjectContent() {
                   className="w-full mt-2 px-3 py-2 bg-[var(--color-card)] border border-[var(--color-border)] rounded-lg text-sm focus:outline-none focus:border-[var(--color-primary)]" />
               </div>
 
-              <button onClick={handleSubmit} disabled={submitting || !softwareName.trim()}
+              <button onClick={handleSubmit} disabled={submitting || !softwareName.trim() || !selectedBranch.trim()}
                 className="w-full py-3 bg-[var(--color-primary)] hover:bg-[var(--color-primary-hover)] text-white rounded-lg font-medium transition-colors disabled:opacity-50 disabled:cursor-not-allowed">
                 {submitting ? "创建中..." : "创建项目"}
               </button>
