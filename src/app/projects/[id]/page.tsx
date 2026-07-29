@@ -5,7 +5,7 @@ import Logo from "@/components/Logo";
 import { useSession } from "next-auth/react";
 import { SessionProvider } from "next-auth/react";
 import { useRouter, useParams } from "next/navigation";
-import { useEffect, useState, useCallback } from "react";
+import { useEffect, useState, useCallback, useRef } from "react";
 import Link from "next/link";
 import { getProject, updateProject, getAIKey, getManualDraft, clearManualDraft, type Project, type SoftwareMeta, type ManualDraft } from "@/lib/storage";
 import { fetchRepoFiles, fetchRepoStats } from "@/lib/github";
@@ -15,6 +15,20 @@ import { generateManualPDF } from "@/lib/docgen/manual-pdf";
 import { parseUserAgent, detectDevTools } from "@/lib/utils";
 
 const steps = ["读取仓库代码", "分析代码结构", "AI 生成元数据", "生成程序鉴别材料", "生成文档鉴别材料", "完成"];
+
+/** Mark a project as interrupted so reopen shows resume UI instead of stuck "准备中". */
+function markGenerationInterrupted(projectId: string): { project: Project; draft: ManualDraft | null; message: string } | null {
+  const p = getProject(projectId);
+  if (!p || p.status !== "PROCESSING") return null;
+  const draft = getManualDraft(projectId);
+  const message = draft?.markdown
+    ? `生成过程被中断（页面关闭或刷新）。已保存说明书草稿 ${draft.lines || 0} 行，可从断点继续。`
+    : "生成过程被中断（页面关闭或刷新）。请重新生成。";
+  updateProject(projectId, { status: "FAILED", errorMsg: message });
+  const updated = getProject(projectId);
+  if (!updated) return null;
+  return { project: updated, draft, message };
+}
 
 function ProjectDetailContent() {
   const { data: session, status } = useSession();
@@ -37,6 +51,12 @@ function ProjectDetailContent() {
   const [editingManual, setEditingManual] = useState(false);
   const [reexporting, setReexporting] = useState(false);
 
+  // Track live generation so unmount/close can flip PROCESSING → FAILED.
+  const generatingRef = useRef(false);
+  useEffect(() => {
+    generatingRef.current = generating;
+  }, [generating]);
+
   const accessToken = (session as { accessToken?: string })?.accessToken;
 
   useEffect(() => {
@@ -52,14 +72,49 @@ function ProjectDetailContent() {
       if (!active) return;
       const p = getProject(projectId);
       if (!p) { router.push("/dashboard"); return; }
+
+      // Generation only runs in this tab's memory. A leftover PROCESSING status
+      // means the previous session was closed/refreshed mid-run — recover to FAILED
+      // so the resume / restart UI is shown instead of endless "准备中...".
+      if (p.status === "PROCESSING") {
+        const recovered = markGenerationInterrupted(projectId);
+        if (recovered) {
+          setProject(recovered.project);
+          setMeta(recovered.project.meta);
+          setManualDraft(recovered.draft);
+          if (recovered.project.manualMarkdown) setManualMarkdown(recovered.project.manualMarkdown);
+          setError(recovered.message);
+          setMetaReady(true);
+          return;
+        }
+      }
+
       setProject(p);
       setMeta(p.meta);
       setManualDraft(getManualDraft(projectId));
       if (p.manualMarkdown) setManualMarkdown(p.manualMarkdown);
+      // DONE / FAILED already have meta; skip auto-detect spinner on reopen
+      if (p.status === "DONE" || p.status === "FAILED") setMetaReady(true);
     };
     void loadProject();
     return () => { active = false; };
   }, [projectId, session, router]);
+
+  // If user navigates away / closes tab while generating, persist interrupted state.
+  useEffect(() => {
+    const onLeave = () => {
+      if (!generatingRef.current) return;
+      markGenerationInterrupted(projectId);
+    };
+    window.addEventListener("pagehide", onLeave);
+    window.addEventListener("beforeunload", onLeave);
+    return () => {
+      window.removeEventListener("pagehide", onLeave);
+      window.removeEventListener("beforeunload", onLeave);
+      // SPA navigation unmount: same recovery so dashboard doesn't stay "生成中"
+      if (generatingRef.current) markGenerationInterrupted(projectId);
+    };
+  }, [projectId]);
 
   // Auto-detect metadata on first visit
   useEffect(() => {
@@ -358,7 +413,9 @@ function ProjectDetailContent() {
           <div className="py-8">
             <div className="mb-6">
               <div className="flex items-center justify-between mb-2">
-                <span className="text-sm text-[var(--color-muted)]">{currentStep || "准备中..."}</span>
+                <span className="text-sm text-[var(--color-muted)]">
+                  {generating ? currentStep || "生成中..." : "准备中..."}
+                </span>
                 <span className="text-sm font-medium">{progress}%</span>
               </div>
               <div className="w-full h-2 bg-[var(--color-border)] rounded-full overflow-hidden">
