@@ -8,7 +8,7 @@ import { useRouter, useParams } from "next/navigation";
 import { useEffect, useState, useCallback, useRef } from "react";
 import Link from "next/link";
 import { getProject, updateProject, getAIKey, getManualDraft, clearManualDraft, type Project, type SoftwareMeta, type ManualDraft } from "@/lib/storage";
-import { fetchRepoFiles, fetchRepoStats } from "@/lib/github";
+import { fetchRepoBranches, fetchRepoFiles, fetchRepoStats, type GitHubBranch } from "@/lib/github";
 import { generateManualMarkdown, callAIForText, buildMetadataPrompt, sanitizeSoftCopyrightText } from "@/lib/ai-helpers";
 import { generateCodePDF } from "@/lib/docgen/code-pdf";
 import { generateManualPDF } from "@/lib/docgen/manual-pdf";
@@ -50,6 +50,12 @@ function ProjectDetailContent() {
   const [manualMarkdown, setManualMarkdown] = useState("");
   const [editingManual, setEditingManual] = useState(false);
   const [reexporting, setReexporting] = useState(false);
+  const [editingProject, setEditingProject] = useState(false);
+  const [projectDraft, setProjectDraft] = useState({ softwareName: "", version: "", completedAt: "", branch: "" });
+  const [branches, setBranches] = useState<GitHubBranch[]>([]);
+  const [loadingBranches, setLoadingBranches] = useState(false);
+  const [branchesLoadAttempted, setBranchesLoadAttempted] = useState(false);
+  const [savingProject, setSavingProject] = useState(false);
 
   // Track live generation so unmount/close can flip PROCESSING → FAILED.
   const generatingRef = useRef(false);
@@ -91,6 +97,14 @@ function ProjectDetailContent() {
 
       setProject(p);
       setMeta(p.meta);
+      setBranches([]);
+      setBranchesLoadAttempted(false);
+      setProjectDraft({
+        softwareName: p.softwareName,
+        version: p.version,
+        completedAt: p.completedAt || "",
+        branch: p.defaultBranch,
+      });
       setManualDraft(getManualDraft(projectId));
       if (p.manualMarkdown) setManualMarkdown(p.manualMarkdown);
       // DONE / FAILED already have meta; skip auto-detect spinner on reopen
@@ -99,6 +113,21 @@ function ProjectDetailContent() {
     void loadProject();
     return () => { active = false; };
   }, [projectId, session, router]);
+
+  useEffect(() => {
+    if (!editingProject || !project || !accessToken || branchesLoadAttempted) return;
+    setBranchesLoadAttempted(true);
+    setLoadingBranches(true);
+    fetchRepoBranches(accessToken, project.repoOwner, project.repoName)
+      .then((data) => {
+        setBranches(data);
+        setLoadingBranches(false);
+      })
+      .catch((e) => {
+        setError(e instanceof Error ? e.message : "获取仓库分支列表失败，请手动填写分支名");
+        setLoadingBranches(false);
+      });
+  }, [editingProject, project, accessToken, branchesLoadAttempted]);
 
   // If user navigates away / closes tab while generating, persist interrupted state.
   useEffect(() => {
@@ -330,6 +359,83 @@ function ProjectDetailContent() {
     setEditingManual(false);
   };
 
+  const startEditProject = () => {
+    if (!project) return;
+    setProjectDraft({
+      softwareName: project.softwareName,
+      version: project.version,
+      completedAt: project.completedAt || "",
+      branch: project.defaultBranch,
+    });
+    setEditingProject(true);
+    setError("");
+  };
+
+  const handleSaveProjectEdit = () => {
+    if (!project || !meta) return;
+    const softwareName = projectDraft.softwareName.trim();
+    const version = projectDraft.version.trim();
+    const branch = projectDraft.branch.trim();
+    if (!softwareName || !version || !branch) {
+      setError("软件全称、版本号和代码分支不能为空");
+      return;
+    }
+
+    setSavingProject(true);
+    const branchChanged = branch !== project.defaultBranch;
+    const materialIdentityChanged = branchChanged || softwareName !== project.softwareName || version !== project.version;
+    const nextMeta: SoftwareMeta = branchChanged
+      ? {
+          ...meta,
+          sourceLines: 0,
+          devTools: "",
+          languagesGiven: [],
+          runPlatform: "",
+          runSupport: "",
+          purpose: "",
+          domain: "",
+          mainFeatures: "",
+          technicalFeatures: "",
+        }
+      : meta;
+
+    if (materialIdentityChanged) {
+      clearManualDraft(projectId);
+      setManualDraft(null);
+      setManualMarkdown("");
+      setCodePdfUrl(null);
+      setManualPdfUrl(null);
+    }
+
+    if (branchChanged) {
+      setMetaReady(false);
+    }
+
+    updateProject(projectId, {
+      softwareName,
+      version,
+      completedAt: projectDraft.completedAt,
+      defaultBranch: branch,
+      meta: nextMeta,
+      status: materialIdentityChanged ? "PENDING" : project.status,
+      errorMsg: undefined,
+      manualMarkdown: materialIdentityChanged ? undefined : project.manualMarkdown,
+    });
+
+    const updated = getProject(projectId)!;
+    setProject(updated);
+    setMeta(updated.meta);
+    setProjectDraft({
+      softwareName: updated.softwareName,
+      version: updated.version,
+      completedAt: updated.completedAt || "",
+      branch: updated.defaultBranch,
+    });
+    setError("");
+    setEditingProject(false);
+    setSavingProject(false);
+  };
+
   const handleReexportManualPDF = async () => {
     if (!project) return;
     const md = manualMarkdown || project.manualMarkdown || "";
@@ -384,6 +490,119 @@ function ProjectDetailContent() {
           <h1 className="text-2xl font-bold mb-2">{project.softwareName}</h1>
           <p className="text-sm text-[var(--color-muted)]">{project.repoOwner}/{project.repoName} · {project.defaultBranch} · {project.version}</p>
         </div>
+
+        {error && project.status !== "FAILED" && (
+          <div className="bg-[var(--color-error)]/10 border border-[var(--color-error)]/20 rounded-xl p-4 mb-6 text-sm text-[var(--color-error)]">
+            {error}
+          </div>
+        )}
+
+        {!generating && project.status !== "PROCESSING" && (
+          <div className="bg-[var(--color-card)] border border-[var(--color-border)] rounded-xl p-5 mb-6">
+            <div className="flex items-start justify-between gap-4">
+              <div>
+                <h2 className="text-base font-semibold">项目设置</h2>
+                <p className="text-xs text-[var(--color-muted)] mt-1">
+                  当前材料来源：{project.repoOwner}/{project.repoName} · {project.defaultBranch}
+                </p>
+              </div>
+              {!editingProject ? (
+                <button
+                  onClick={startEditProject}
+                  className="px-3 py-1.5 text-xs border border-[var(--color-border)] rounded-lg hover:border-[var(--color-primary)] transition-colors"
+                >
+                  编辑项目
+                </button>
+              ) : null}
+            </div>
+
+            {editingProject ? (
+              <div className="mt-4 space-y-4">
+                <div className="grid grid-cols-2 gap-4">
+                  <div>
+                    <label className="block text-xs text-[var(--color-muted)] mb-1">软件全称 *</label>
+                    <input
+                      type="text"
+                      value={projectDraft.softwareName}
+                      onChange={(e) => setProjectDraft((prev) => ({ ...prev, softwareName: e.target.value }))}
+                      className="w-full px-3 py-2 bg-[var(--color-input-bg)] border border-[var(--color-border)] rounded-lg text-sm focus:outline-none focus:border-[var(--color-primary)]"
+                    />
+                  </div>
+                  <div>
+                    <label className="block text-xs text-[var(--color-muted)] mb-1">版本号 *</label>
+                    <input
+                      type="text"
+                      value={projectDraft.version}
+                      onChange={(e) => setProjectDraft((prev) => ({ ...prev, version: e.target.value }))}
+                      className="w-full px-3 py-2 bg-[var(--color-input-bg)] border border-[var(--color-border)] rounded-lg text-sm focus:outline-none focus:border-[var(--color-primary)]"
+                    />
+                  </div>
+                </div>
+
+                <div className="grid grid-cols-2 gap-4">
+                  <div>
+                    <label className="block text-xs text-[var(--color-muted)] mb-1">开发完成日期</label>
+                    <input
+                      type="date"
+                      value={projectDraft.completedAt}
+                      onChange={(e) => setProjectDraft((prev) => ({ ...prev, completedAt: e.target.value }))}
+                      className="w-full px-3 py-2 bg-[var(--color-input-bg)] border border-[var(--color-border)] rounded-lg text-sm focus:outline-none focus:border-[var(--color-primary)]"
+                    />
+                  </div>
+                  <div>
+                    <label className="block text-xs text-[var(--color-muted)] mb-1">代码分支 *</label>
+                    {branches.length > 0 ? (
+                      <select
+                        value={projectDraft.branch}
+                        onChange={(e) => setProjectDraft((prev) => ({ ...prev, branch: e.target.value }))}
+                        disabled={loadingBranches}
+                        className="w-full px-3 py-2 bg-[var(--color-input-bg)] border border-[var(--color-border)] rounded-lg text-sm focus:outline-none focus:border-[var(--color-primary)] disabled:opacity-50"
+                      >
+                        {projectDraft.branch && !branches.some((branch) => branch.name === projectDraft.branch) ? (
+                          <option value={projectDraft.branch}>{projectDraft.branch}（当前保存分支）</option>
+                        ) : null}
+                        {branches.map((branch) => (
+                          <option key={branch.name} value={branch.name}>{branch.name}</option>
+                        ))}
+                      </select>
+                    ) : (
+                      <input
+                        type="text"
+                        value={projectDraft.branch}
+                        onChange={(e) => setProjectDraft((prev) => ({ ...prev, branch: e.target.value }))}
+                        placeholder={loadingBranches ? "正在读取分支列表..." : "请输入分支名"}
+                        disabled={loadingBranches}
+                        className="w-full px-3 py-2 bg-[var(--color-input-bg)] border border-[var(--color-border)] rounded-lg text-sm focus:outline-none focus:border-[var(--color-primary)] disabled:opacity-50"
+                      />
+                    )}
+                  </div>
+                </div>
+
+                {projectDraft.branch.trim() && projectDraft.branch.trim() !== project.defaultBranch ? (
+                  <p className="text-xs text-[var(--color-muted)]">
+                    切换分支后，已生成的程序/文档材料将不再沿用，保存后需要重新检测并生成。
+                  </p>
+                ) : null}
+
+                <div className="flex flex-wrap gap-2">
+                  <button
+                    onClick={handleSaveProjectEdit}
+                    disabled={savingProject || !projectDraft.softwareName.trim() || !projectDraft.version.trim() || !projectDraft.branch.trim()}
+                    className="px-4 py-2 text-sm bg-[var(--color-primary)] hover:bg-[var(--color-primary-hover)] text-white rounded-lg transition-colors disabled:opacity-50"
+                  >
+                    {savingProject ? "保存中..." : "保存项目"}
+                  </button>
+                  <button
+                    onClick={() => { setEditingProject(false); setError(""); }}
+                    className="px-4 py-2 text-sm border border-[var(--color-border)] rounded-lg text-[var(--color-muted)] hover:text-[var(--color-foreground)] hover:border-[var(--color-muted)] transition-colors"
+                  >
+                    取消
+                  </button>
+                </div>
+              </div>
+            ) : null}
+          </div>
+        )}
 
         {/* Metadata display/edit */}
         {project.status === "PENDING" && !generating && (
