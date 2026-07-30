@@ -603,6 +603,12 @@ export interface ManualAuditFinding {
   category: string;
   /** 出现问题的章节或位置描述 */
   location: string;
+  /**
+   * Verbatim heading line of the section the problem lives in, e.g.
+   * "## 2.4 网络与端口". Used to locate the exact text to rewrite; empty when the
+   * model couldn't point at one heading.
+   */
+  anchor: string;
   problem: string;
   suggestion: string;
 }
@@ -668,14 +674,19 @@ ${doc}
   "findings": [
     {
       "severity": "high | medium | low",
-      "category": "幻觉 | 一致性 | 软著规范 | 完整性 | 其它",
-      "location": "问题所在章节或小节",
+      "category": "幻觉 | 一致性 | 软著规范 | 完整性 | 结构 | 其它",
+      "location": "问题所在章节或小节（可读描述）",
+      "anchor": "该问题所在小节的标题原文，必须与文档中的某一行完全一致（含 # 号），例如「## 2.4 网络与端口」；若问题跨越整章则填该章的一级标题原文；实在无法定位时填空字符串",
       "problem": "具体问题",
       "suggestion": "如何修改"
     }
   ],
   "strengths": ["合格/亮点项，若干条"]
-}`;
+}
+
+关于 anchor 的要求（很重要，后续会按它定位并自动修订该段落）：
+- 必须从上面文档中原样复制标题行，包括 ## 符号、编号和空格，不要自己改写或加引号。
+- 一个 finding 只对应一个 anchor。如果同一类问题散布在多个小节，请拆成多个 finding。`;
 }
 
 function clampScore(v: unknown): number {
@@ -713,6 +724,8 @@ export async function auditManualMarkdown(input: {
         severity,
         category: sanitizeSoftCopyrightText(String(it.category || "其它")),
         location: sanitizeSoftCopyrightText(String(it.location || "")),
+        // Not sanitized: it must match the document byte-for-byte to locate the section.
+        anchor: typeof it.anchor === "string" ? it.anchor.trim() : "",
         problem: sanitizeSoftCopyrightText(String(it.problem || "")),
         suggestion: sanitizeSoftCopyrightText(String(it.suggestion || "")),
       };
@@ -728,6 +741,171 @@ export async function auditManualMarkdown(input: {
     findings,
     strengths,
   };
+}
+
+// ── Targeted revision: rewrite just the section an audit finding points at ──
+
+export interface LocatedSection {
+  /** Heading line as it appears in the document. */
+  heading: string;
+  /** Full section text, heading line included. */
+  text: string;
+  /** Character offsets into the document. */
+  start: number;
+  end: number;
+  /** How the section was found — surfaced so the user can sanity-check it. */
+  matchedBy: "exact" | "normalized" | "contains";
+}
+
+/**
+ * Find the section a finding's `anchor` refers to.
+ *
+ * Three passes, loosening in turn: byte-identical heading line, then the heading
+ * with numbering/punctuation/whitespace stripped, then substring containment.
+ * A section runs from its heading up to the next heading of the same or higher
+ * level, so rewriting it can't swallow sibling sections.
+ */
+export function locateSection(markdown: string, anchor: string): LocatedSection | null {
+  const target = anchor.trim();
+  if (!target) return null;
+
+  const lines = markdown.split("\n");
+  const targetKey = headingKey(target);
+  if (!targetKey) return null;
+
+  const headings: { index: number; line: string; level: number }[] = [];
+  for (let i = 0; i < lines.length; i++) {
+    const m = /^(#{1,6})\s+/.exec(lines[i]);
+    if (m) headings.push({ index: i, line: lines[i], level: m[1].length });
+  }
+  if (!headings.length) return null;
+
+  const passes: Array<{ by: LocatedSection["matchedBy"]; test: (line: string) => boolean }> = [
+    { by: "exact", test: (line) => line.trim() === target },
+    { by: "normalized", test: (line) => headingKey(line) === targetKey },
+    {
+      by: "contains",
+      test: (line) => {
+        const key = headingKey(line);
+        return key.length > 0 && (key.includes(targetKey) || targetKey.includes(key));
+      },
+    },
+  ];
+
+  for (const pass of passes) {
+    const hit = headings.find((h) => pass.test(h.line));
+    if (!hit) continue;
+    // End at the next heading that is not nested inside this one.
+    const next = headings.find((h) => h.index > hit.index && h.level <= hit.level);
+    const endLine = next ? next.index : lines.length;
+    const start = lines.slice(0, hit.index).reduce((n, l) => n + l.length + 1, 0);
+    const text = lines.slice(hit.index, endLine).join("\n").replace(/\s+$/, "");
+    return {
+      heading: hit.line.trim(),
+      text,
+      start,
+      end: start + text.length,
+      matchedBy: pass.by,
+    };
+  }
+  return null;
+}
+
+/** Replace a located section's text in the document. */
+export function replaceSection(markdown: string, section: LocatedSection, replacement: string): string {
+  const before = markdown.slice(0, section.start);
+  const after = markdown.slice(section.end);
+  return before + replacement.replace(/\s+$/, "") + after;
+}
+
+export function buildSectionRevisionPrompt(input: {
+  softwareName: string;
+  version: string;
+  meta: Record<string, unknown>;
+  languages: string;
+  fileTree: string;
+  /** Section headings elsewhere in the document — keeps naming consistent. */
+  documentOutline: string;
+  sectionText: string;
+  problem: string;
+  suggestion: string;
+}): string {
+  return `你是中国软件著作权「文档鉴别材料/操作说明书」撰写专家。下面给出说明书中的**一个小节**，以及审核指出的问题。请按审核意见重写这个小节。
+
+硬性要求：
+- 只输出重写后的这一个小节的 Markdown，**首行必须是原来的标题行，一字不改**。
+- 不要输出其它小节，不要输出说明、前言、结语，不要用代码围栏包裹。
+- 保持原有的标题层级与编号；小节内部可以增删 ### 子标题和段落。
+- 篇幅与原文相当或略多，不要大幅缩短（软著文档鉴别材料需要足够篇幅）。
+- 只修正审核指出的问题，其余正确内容尽量保留原样，避免引入新的不一致。
+
+【严禁编造具体事实】没有依据时必须改用概括表述：
+- 编程语言只能使用下面「编程语言」中列出的；不要自行添加其它语言。
+- 端口号、IP、数据库名、精确版本号：改写为「按部署环境配置的服务端口」「参见运行支撑环境要求」这类表述。
+- 安装脚本名、可执行文件名、具体命令：改写为「运行安装程序」「执行项目提供的启动命令」这类表述。
+- 第三方库名、协议名、硬件型号：同上。
+- 功能模块名必须与「主要功能」以及下面的文档大纲一致，不要另起名字。
+${SOFT_COPYRIGHT_COMPLIANCE_RULES}
+
+软件名称：${input.softwareName} ${input.version}
+编程语言：${input.languages || "未知"}
+登记信息（JSON）：
+${JSON.stringify(input.meta, null, 2)}
+仓库目录结构（节选）：
+${input.fileTree.slice(0, 1500)}
+
+全文小节大纲（重写时沿用这些名称，不要与之矛盾）：
+${input.documentOutline.slice(0, 2500) || "（无）"}
+
+审核指出的问题：${input.problem}
+审核给出的修改建议：${input.suggestion}
+
+需要重写的小节原文：
+"""
+${input.sectionText.slice(0, 12000)}
+"""`;
+}
+
+/**
+ * Rewrite one section per an audit finding. Returns the new section text with its
+ * original heading restored — the model is asked to keep it, but a changed heading
+ * would break the anchor for any later finding, so it's enforced here too.
+ */
+export async function reviseSection(input: {
+  softwareName: string;
+  version: string;
+  meta: Record<string, unknown>;
+  languages: string;
+  fileTree: string;
+  documentOutline: string;
+  section: LocatedSection;
+  problem: string;
+  suggestion: string;
+}): Promise<string> {
+  const { text } = await callAILongWithRetry(
+    [{ role: "user", content: buildSectionRevisionPrompt({ ...input, sectionText: input.section.text }) }],
+    undefined,
+    "AI 修订小节"
+  );
+  let revised = stripModelFences(text).trim();
+  if (!revised) throw new Error("AI 未返回修订内容，请重试");
+
+  // Force the original heading back on: drop a leading heading line (whatever the
+  // model produced) and prepend the real one.
+  const firstLine = revised.split("\n", 1)[0] ?? "";
+  if (/^#{1,6}\s+/.test(firstLine.trim())) {
+    revised = revised.slice(firstLine.length).replace(/^\n+/, "");
+  }
+  return sanitizeSoftCopyrightText(`${input.section.heading}\n\n${revised}`.trim());
+}
+
+/** Heading outline of a document, for continuity context in revision prompts. */
+export function documentOutline(markdown: string): string {
+  return markdown
+    .split("\n")
+    .filter((l) => /^#{1,6}\s+/.test(l.trim()))
+    .map((l) => l.trim())
+    .join("\n");
 }
 
 export function buildAutoNamePrompt(repoName: string, description: string, language: string): string {

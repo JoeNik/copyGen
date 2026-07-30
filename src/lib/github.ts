@@ -163,6 +163,19 @@ async function fetchContent(
   return { content: typeof data.content === "string" ? data.content : "", ok: true };
 }
 
+/**
+ * Files that count toward 源程序量.
+ *
+ * Deliberately different from `filterByLanguageRatio`: that one narrows to the
+ * top few extensions because the code appendix should read as one coherent
+ * program, but line COUNTING must cover every source file in the repo. Using the
+ * narrow filter for counting under-reported polyglot repos badly — a project with
+ * Vue + TS + JS dominant would silently drop its Kotlin, Java and Python files.
+ */
+function selectCountableCodeFiles(tree: GitHubFile[]): GitHubFile[] {
+  return tree.filter((f) => !NON_CODE_EXT.has(getExt(f.path)) && (f.size || 0) > 0);
+}
+
 /** Count source lines, treating an empty file as 0 rather than 1. */
 function countLines(text: string): number {
   if (!text) return 0;
@@ -223,16 +236,18 @@ export async function fetchRepoFiles(
   extRatios: { ext: string; count: number; ratio: number }[];
   totalTreeSize: number;
   /**
-   * Source lines across the whole repo's code files, estimated from tree blob
-   * sizes for the files that weren't downloaded. `files` is capped by MAX_FILES /
-   * MAX_TOTAL_CHARS for the code appendix, so counting only those under-reports
-   * 源程序量 badly on any repo bigger than the cap.
+   * Source lines across the whole repo's code files: real counts for the files we
+   * downloaded, blob-size estimates (calibrated against those reads) for the rest.
+   * `files` is capped by MAX_FILES / MAX_TOTAL_CHARS for the code appendix, so
+   * counting only those under-reports 源程序量 badly on any repo past the cap.
    */
   totalSourceLines: number;
   /** How many files were actually read (vs. estimated). */
   readFileCount: number;
-  /** Code files in the repo after filtering. */
+  /** Code files in the repo that count toward 源程序量. */
   codeFileCount: number;
+  /** Countable files whose lines were estimated rather than read. */
+  estimatedFileCount: number;
 }> {
   onProgress?.("正在读取仓库文件列表...", 5);
   const fullTree = await fetchTree(token, owner, repo, branch);
@@ -297,9 +312,17 @@ export async function fetchRepoFiles(
     onProgress?.(`正在读取文件... (${files.length}/${filteredTree.length})${stopped ? " (已足够)" : ""}`, percent);
   }
 
-  // Estimate lines for code files we never downloaded, using blob size.
-  // ~34 bytes/line is typical for source once comments are stripped; derive it
-  // from this repo's own read files when we have a usable sample.
+  // ── 源程序量 ──
+  //
+  // Counted over EVERY code file in the repo, not just `filteredTree`. The latter
+  // narrows to the top few extensions so the code appendix reads coherently; using
+  // it for counting dropped whole languages (a Vue/TS repo silently lost its
+  // Kotlin, Java and Python files), which is how a ~100k-line repo reported ~8k.
+  const countableFiles = selectCountableCodeFiles(fullTree);
+
+  // Calibrate bytes-per-line against the files we actually read, then apply that
+  // ratio to everything we didn't. ~34 bytes/line is the fallback for typical
+  // source once comments are stripped.
   let bytesPerLine = 34;
   const readBytes = filesToRead
     .filter((f) => readPaths.has(f.path))
@@ -309,10 +332,19 @@ export async function fetchRepoFiles(
     if (observed >= 8 && observed <= 200) bytesPerLine = observed;
   }
 
-  let estimatedLines = 0;
-  for (const f of filteredTree) {
+  let countedLines = 0;
+  let estimatedFileCount = 0;
+  for (const f of countableFiles) {
     if (readPaths.has(f.path)) continue;
-    estimatedLines += Math.round((f.size || 0) / bytesPerLine);
+    countedLines += Math.round((f.size || 0) / bytesPerLine);
+    estimatedFileCount++;
+  }
+  // Read files contribute their real line counts, but only those that are also
+  // countable — `filteredTree` and `countableFiles` are near-identical in practice,
+  // yet double-counting or omitting would both skew the total.
+  const countablePaths = new Set(countableFiles.map((f) => f.path));
+  for (const f of files) {
+    if (countablePaths.has(f.path)) countedLines += countLines(f.content);
   }
 
   if (failedReads > 0) {
@@ -325,9 +357,10 @@ export async function fetchRepoFiles(
     languages,
     extRatios,
     totalTreeSize: fullTree.length,
-    totalSourceLines: readLines + estimatedLines,
+    totalSourceLines: countedLines,
     readFileCount: files.length,
-    codeFileCount: filteredTree.length,
+    codeFileCount: countableFiles.length,
+    estimatedFileCount,
   };
 }
 
@@ -471,10 +504,9 @@ export async function fetchRepoStats(
     .map((r) => r.ext.replace(".", "").toUpperCase());
 
   // Estimate lines from code files only — counting every blob (JSON fixtures,
-  // lock files, SVGs) inflates 源程序量. ~34 bytes/line for typical source.
-  const codeBytes = tree
-    .filter((f) => !NON_CODE_EXT.has(getExt(f.path)))
-    .reduce((sum, f) => sum + (f.size || 0), 0);
+  // lock files, SVGs) inflates 源程序量. Same file selection as the full run so
+  // the pre-generation figure and the final registered figure don't disagree.
+  const codeBytes = selectCountableCodeFiles(tree).reduce((sum, f) => sum + (f.size || 0), 0);
   const estimatedLines = Math.round(codeBytes / 34);
 
   return { allFilePaths, languages, estimatedLines, totalTreeSize: tree.length };
@@ -503,7 +535,7 @@ export async function estimateRepoSourceLines(
 }> {
   onProgress?.("正在读取仓库文件树...");
   const fullTree = await fetchTree(token, owner, repo, branch);
-  const codeFiles = filterByLanguageRatio(fullTree).filter((f) => (f.size || 0) > 0);
+  const codeFiles = selectCountableCodeFiles(fullTree);
   if (codeFiles.length === 0) {
     return { sourceLines: 0, codeFileCount: 0, sampledFileCount: 0, bytesPerLine: 34 };
   }

@@ -12,7 +12,7 @@ import { useEffect, useState, useCallback } from "react";
 import Link from "next/link";
 import { getProject, updateProject, getAIKey, getManualDraft, saveManualDraft, clearManualDraft, type Project, type SoftwareMeta, type ManualDraft } from "@/lib/storage";
 import { fetchRepoBranches, fetchRepoFiles, fetchRepoStats, fetchRepoLanguages, fetchRepoInsights, fetchRepo, estimateRepoSourceLines, type GitHubBranch } from "@/lib/github";
-import { generateManualMarkdown, callAIForText, generateProjectMetadata, sanitizeSoftCopyrightText, reviewProjectMeta, auditManualMarkdown, buildTechCategoriesFromInsightsPrompt, summarizeRepoDescription, dedupeManualDocument, countDocumentLines, type MetaReviewResult, type ManualAuditResult } from "@/lib/ai-helpers";
+import { generateManualMarkdown, callAIForText, generateProjectMetadata, sanitizeSoftCopyrightText, reviewProjectMeta, auditManualMarkdown, buildTechCategoriesFromInsightsPrompt, summarizeRepoDescription, locateSection, replaceSection, reviseSection, documentOutline, countDocumentLines, type MetaReviewResult, type ManualAuditResult } from "@/lib/ai-helpers";
 import { generateCodePDF } from "@/lib/docgen/code-pdf";
 import { generateManualPDF } from "@/lib/docgen/manual-pdf";
 import { parseUserAgent, detectDevTools, mapLinguistToGivenLanguages, describeLanguageStats, GIVEN_LANGUAGES, GIVEN_TECH_CATEGORIES, SOFTWARE_CATEGORIES } from "@/lib/utils";
@@ -147,6 +147,13 @@ function ProjectDetailContent() {
   const [manualAudit, setManualAudit] = useState<ManualAuditResult | null>(null);
   const [auditingManual, setAuditingManual] = useState(false);
   const [auditError, setAuditError] = useState("");
+  /** Index of the finding currently being rewritten by AI. */
+  const [revisingFinding, setRevisingFinding] = useState<number | null>(null);
+  /** Staged section rewrites, keyed by finding index — reviewed before applying. */
+  const [revisionDrafts, setRevisionDrafts] = useState<
+    Record<number, { heading: string; before: string; after: string; matchedBy: string }>
+  >({});
+  const [appliedRevisions, setAppliedRevisions] = useState<Record<number, boolean>>({});
 
   /** Pending action awaiting二次确认 (guards misclicks during/after generation). */
   const [pendingConfirm, setPendingConfirm] = useState<{
@@ -459,7 +466,7 @@ function ProjectDetailContent() {
     startRun(projectId, async (emit): Promise<GenerationResult> => {
       // Step 0: Fetch files
       emit({ stepIndex: 0, currentStep: "正在读取仓库代码...", progress: 5 });
-      const { files, languages: langExts, totalSourceLines, readFileCount, codeFileCount } = await fetchRepoFiles(
+      const { files, languages: langExts, totalSourceLines, readFileCount, codeFileCount, estimatedFileCount } = await fetchRepoFiles(
         token, snapshot.repoOwner, snapshot.repoName, snapshot.branch,
         (msg, pct) => emit({ currentStep: msg, progress: pct })
       );
@@ -469,11 +476,11 @@ function ProjectDetailContent() {
       const languageStr = langExts.slice(0, 10).join(", ");
       const fileTree = files.slice(0, 50).map((f) => f.path).join("\n");
       const codeSummary = files.slice(0, 10).map((f) => `// ${f.path}\n${f.content.slice(0, 500)}`).join("\n\n").slice(0, 4000);
-      if (codeFileCount > readFileCount) {
-        emit({
-          currentStep: `代码文件 ${codeFileCount} 个，已下载 ${readFileCount} 个；源程序量按仓库整体估算为 ${totalSourceLines} 行`,
-        });
-      }
+      emit({
+        currentStep: estimatedFileCount > 0
+          ? `源程序量 ${totalSourceLines} 行（代码文件 ${codeFileCount} 个：实读 ${readFileCount} 个，其余 ${estimatedFileCount} 个按体积估算）`
+          : `源程序量 ${totalSourceLines} 行（代码文件 ${codeFileCount} 个，全部实读）`,
+      });
 
       // Persist richer repo snapshot for AI 核对/审核 after page refresh, keeping
       // the README/moduleDirs captured during auto-detection.
@@ -1174,6 +1181,9 @@ function ProjectDetailContent() {
         markdown: md,
       });
       setManualAudit(result);
+      // A fresh audit invalidates staged rewrites from the previous one.
+      setRevisionDrafts({});
+      setAppliedRevisions({});
     } catch (e) {
       setAuditError(e instanceof Error ? e.message : "审核失败，请重试");
     } finally {
@@ -1182,39 +1192,83 @@ function ProjectDetailContent() {
   };
 
   /**
-   * Repair an already-generated document by collapsing duplicated chapters and
-   * sections. Older documents were produced before continuation merging existed,
-   * so the same chapter can appear two or three times — the single biggest source
-   * of "自相矛盾" in audit results.
+   * Rewrite the one section an audit finding points at.
+   *
+   * The finding carries an `anchor` (the section's heading line as it appears in
+   * the document); we locate that section, send only it to the AI along with the
+   * problem and the document's heading outline, and splice the result back in
+   * place. Scoping the rewrite to one section is what keeps the rest of the
+   * document byte-identical — a whole-document rewrite would churn text the audit
+   * already passed.
    */
-  const handleDedupeManual = () => {
-    if (!project) return;
+  const handleReviseFinding = async (idx: number) => {
+    if (!project || !meta || !manualAudit) return;
+    const finding = manualAudit.findings[idx];
+    if (!finding) return;
     const md = manualMarkdown || project.manualMarkdown || "";
     if (!md.trim()) {
-      setAuditError("没有可清理的说明书内容");
+      setAuditError("没有可修订的说明书内容");
       return;
     }
-    const cleaned = dedupeManualDocument(md);
-    const removed = countDocumentLines(md) - countDocumentLines(cleaned);
-    if (removed <= 0) {
-      setAuditError("未发现重复的章节或小节");
+
+    const section = locateSection(md, finding.anchor || finding.location);
+    if (!section) {
+      setAuditError(
+        `无法在文稿中定位「${finding.anchor || finding.location || "该问题"}」，请手动修改，或重新审核以获取准确定位。`
+      );
       return;
     }
-    requestConfirm({
-      title: "清理重复章节？",
-      message: `检测到 ${removed} 行重复内容（重复的章节或小节）。清理后文稿会被替换，PDF 需要重新导出。`,
-      confirmLabel: "清理并保存",
-      destructive: true,
-      run: () => {
-        setManualMarkdown(cleaned);
-        updateProject(projectId, { manualMarkdown: cleaned });
-        setProject(getProject(projectId)!);
-        // The exported PDF no longer matches the text.
-        if (manualPdfUrl) { URL.revokeObjectURL(manualPdfUrl); setManualPdfUrl(null); }
-        setAuditError("");
-        setCurrentStep(`已清理 ${removed} 行重复内容，请重新导出 PDF`);
-      },
-    });
+
+    setRevisingFinding(idx);
+    setAuditError("");
+    try {
+      const revised = await reviseSection({
+        softwareName: project.softwareName,
+        version: project.version,
+        meta: meta as unknown as Record<string, unknown>,
+        languages: project.reviewContext?.languages || meta.languagesGiven.join(", "),
+        fileTree: project.reviewContext?.fileTree || "",
+        documentOutline: documentOutline(md),
+        section,
+        problem: finding.problem,
+        suggestion: finding.suggestion,
+      });
+      // Stage rather than apply: the user compares before/after and decides.
+      setRevisionDrafts((prev) => ({
+        ...prev,
+        [idx]: { heading: section.heading, before: section.text, after: revised, matchedBy: section.matchedBy },
+      }));
+    } catch (e) {
+      setAuditError(e instanceof Error ? e.message : "AI 修订失败，请重试");
+    } finally {
+      setRevisingFinding(null);
+    }
+  };
+
+  /** Write a staged revision (possibly hand-edited) back into the document. */
+  const handleApplyRevision = (idx: number) => {
+    if (!project) return;
+    const draft = revisionDrafts[idx];
+    if (!draft) return;
+    const md = manualMarkdown || project.manualMarkdown || "";
+    // Re-locate: an earlier applied revision may have shifted every offset.
+    const section = locateSection(md, draft.heading);
+    if (!section) {
+      setAuditError(`「${draft.heading}」在当前文稿中已找不到，可能已被其它修订改动，请重新审核。`);
+      return;
+    }
+    const next = replaceSection(md, section, draft.after);
+    setManualMarkdown(next);
+    try {
+      updateProject(projectId, { manualMarkdown: next });
+      setProject(getProject(projectId)!);
+    } catch (e) {
+      setAuditError(e instanceof Error ? e.message : "保存修订失败（本地存储可能已满）");
+    }
+    setAppliedRevisions((prev) => ({ ...prev, [idx]: true }));
+    // The exported PDF no longer matches the text.
+    if (manualPdfUrl) { URL.revokeObjectURL(manualPdfUrl); setManualPdfUrl(null); }
+    setCurrentStep(`已应用「${draft.heading}」的修订，全部修订完成后请重新导出 PDF 并再次审核`);
   };
 
   const handleReexportManualPDF = async () => {
@@ -1923,14 +1977,6 @@ function ProjectDetailContent() {
                 </div>
                 <div className="flex items-center gap-2">
                   <button
-                    onClick={handleDedupeManual}
-                    disabled={auditingManual || generating || reexporting}
-                    className="px-3 py-1.5 text-xs border border-[var(--color-border)] rounded-lg hover:border-[var(--color-primary)] transition-colors disabled:opacity-50"
-                    title="检查并合并文稿中重复出现的章节或小节"
-                  >
-                    清理重复章节
-                  </button>
-                  <button
                     onClick={handleAuditManual}
                     disabled={auditingManual || generating}
                     className="px-3 py-1.5 text-xs border border-[var(--color-border)] rounded-lg hover:border-[var(--color-primary)] transition-colors disabled:opacity-50 flex items-center gap-1.5"
@@ -1946,7 +1992,7 @@ function ProjectDetailContent() {
                         <svg className="w-3.5 h-3.5" fill="none" viewBox="0 0 24 24" stroke="currentColor">
                           <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M9 5H7a2 2 0 00-2 2v12a2 2 0 002 2h10a2 2 0 002-2V7a2 2 0 00-2-2h-2M9 5a2 2 0 002 2h2a2 2 0 002-2M9 5a2 2 0 012-2h2a2 2 0 012 2m-6 9l2 2 4-4" />
                         </svg>
-                        审核说明书
+                        {manualAudit ? "重新审核" : "审核说明书"}
                       </>
                     )}
                   </button>
@@ -2002,41 +2048,144 @@ function ProjectDetailContent() {
                         发现的问题 ({manualAudit.findings.length})
                       </div>
                       <div className="space-y-2">
-                        {manualAudit.findings.map((finding, idx) => (
-                          <div
-                            key={idx}
-                            className={`border rounded-lg p-3 text-xs ${
-                              finding.severity === "high"
-                                ? "border-[var(--color-error)]/30 bg-[var(--color-error)]/5"
-                                : finding.severity === "low"
-                                ? "border-[var(--color-border)] bg-white/40"
-                                : "border-[#C4612F]/30 bg-white/60"
-                            }`}
-                          >
-                            <div className="flex items-start justify-between gap-2 mb-1">
-                              <span className="font-medium text-[#1F2421]">{finding.category}</span>
-                              <span
-                                className={`px-1.5 py-0.5 rounded text-[10px] ${
-                                  finding.severity === "high"
-                                    ? "bg-[var(--color-error)]/20 text-[var(--color-error)]"
-                                    : finding.severity === "low"
-                                    ? "bg-[var(--color-muted)]/20 text-[var(--color-muted)]"
-                                    : "bg-[#C4612F]/20 text-[#C4612F]"
-                                }`}
-                              >
-                                {finding.severity === "high" ? "严重" : finding.severity === "low" ? "轻微" : "中等"}
-                              </span>
+                        {manualAudit.findings.map((finding, idx) => {
+                          const draft = revisionDrafts[idx];
+                          const applied = appliedRevisions[idx];
+                          const revising = revisingFinding === idx;
+                          return (
+                            <div
+                              key={idx}
+                              className={`border rounded-lg p-3 text-xs ${
+                                applied
+                                  ? "border-[var(--color-success)]/40 bg-[var(--color-success)]/5"
+                                  : finding.severity === "high"
+                                  ? "border-[var(--color-error)]/30 bg-[var(--color-error)]/5"
+                                  : finding.severity === "low"
+                                  ? "border-[var(--color-border)] bg-white/40"
+                                  : "border-[#C4612F]/30 bg-white/60"
+                              }`}
+                            >
+                              <div className="flex items-start justify-between gap-2 mb-1">
+                                <span className="font-medium text-[#1F2421]">{finding.category}</span>
+                                <div className="flex items-center gap-1.5">
+                                  {applied && (
+                                    <span className="text-[10px] text-[var(--color-success)]">✓ 已修订</span>
+                                  )}
+                                  <span
+                                    className={`px-1.5 py-0.5 rounded text-[10px] ${
+                                      finding.severity === "high"
+                                        ? "bg-[var(--color-error)]/20 text-[var(--color-error)]"
+                                        : finding.severity === "low"
+                                        ? "bg-[var(--color-muted)]/20 text-[var(--color-muted)]"
+                                        : "bg-[#C4612F]/20 text-[#C4612F]"
+                                    }`}
+                                  >
+                                    {finding.severity === "high" ? "严重" : finding.severity === "low" ? "轻微" : "中等"}
+                                  </span>
+                                </div>
+                              </div>
+                              {finding.location && (
+                                <p className="text-[#5C635D] mb-1">位置：{finding.location}</p>
+                              )}
+                              {finding.anchor && (
+                                <p className="text-[#5C635D] mb-1 font-mono text-[10px] break-all">
+                                  定位：{finding.anchor}
+                                </p>
+                              )}
+                              <p className="text-[#5C635D] mb-1">问题：{finding.problem}</p>
+                              <p className="text-[#5C635D] mb-2">建议：{finding.suggestion}</p>
+
+                              {!draft && !applied && (
+                                <button
+                                  onClick={() => handleReviseFinding(idx)}
+                                  disabled={revising || revisingFinding !== null || generating || reexporting}
+                                  className="px-2 py-1 text-[10px] border border-[var(--color-border)] rounded hover:border-[var(--color-primary)] transition-colors disabled:opacity-50 flex items-center gap-1"
+                                >
+                                  {revising ? (
+                                    <>
+                                      <div className="spinner w-2.5 h-2.5 border border-[var(--color-primary)] border-t-transparent rounded-full" />
+                                      AI 修订中...
+                                    </>
+                                  ) : (
+                                    "AI 修订该段落"
+                                  )}
+                                </button>
+                              )}
+
+                              {draft && (
+                                <div className="mt-2 space-y-2 border-t border-[var(--color-border)] pt-2">
+                                  <div className="flex items-center justify-between gap-2">
+                                    <span className="text-[10px] text-[#5C635D]">
+                                      定位到「{draft.heading}」
+                                      {draft.matchedBy !== "exact" && (
+                                        <span className="text-[var(--color-error)] ml-1">
+                                          （模糊匹配，请确认段落是否正确）
+                                        </span>
+                                      )}
+                                    </span>
+                                  </div>
+                                  <details className="text-[10px]">
+                                    <summary className="cursor-pointer text-[#5C635D] hover:text-[#1F2421]">
+                                      查看修订前原文（{countDocumentLines(draft.before)} 行）
+                                    </summary>
+                                    <pre className="mt-1 max-h-48 overflow-auto whitespace-pre-wrap bg-white/60 border border-[var(--color-border)] rounded p-2 text-[10px] leading-relaxed">
+                                      {draft.before}
+                                    </pre>
+                                  </details>
+                                  <div>
+                                    <div className="text-[10px] text-[#5C635D] mb-1">
+                                      修订后（{countDocumentLines(draft.after)} 行，可手动编辑）：
+                                    </div>
+                                    <textarea
+                                      value={draft.after}
+                                      onChange={(e) =>
+                                        setRevisionDrafts((prev) => ({
+                                          ...prev,
+                                          [idx]: { ...prev[idx], after: e.target.value },
+                                        }))
+                                      }
+                                      rows={12}
+                                      className="w-full px-2 py-1.5 bg-[var(--color-input-bg)] border border-[var(--color-border)] rounded text-[10px] font-mono leading-relaxed focus:outline-none focus:border-[var(--color-primary)]"
+                                    />
+                                  </div>
+                                  <div className="flex flex-wrap items-center gap-2">
+                                    {!applied && (
+                                      <button
+                                        onClick={() => handleApplyRevision(idx)}
+                                        disabled={!draft.after.trim()}
+                                        className="px-2 py-1 text-[10px] bg-[var(--color-primary)] hover:bg-[var(--color-primary-hover)] text-white rounded transition-colors disabled:opacity-50"
+                                      >
+                                        写回文稿
+                                      </button>
+                                    )}
+                                    <button
+                                      onClick={() => handleReviseFinding(idx)}
+                                      disabled={revising || revisingFinding !== null}
+                                      className="px-2 py-1 text-[10px] border border-[var(--color-border)] rounded text-[#5C635D] hover:border-[var(--color-muted)] transition-colors disabled:opacity-50"
+                                    >
+                                      重新生成修订
+                                    </button>
+                                    <button
+                                      onClick={() =>
+                                        setRevisionDrafts((prev) => {
+                                          const next = { ...prev };
+                                          delete next[idx];
+                                          return next;
+                                        })
+                                      }
+                                      className="px-2 py-1 text-[10px] text-[#5C635D] hover:text-[#1F2421] transition-colors"
+                                    >
+                                      放弃
+                                    </button>
+                                  </div>
+                                </div>
+                              )}
                             </div>
-                            {finding.location && (
-                              <p className="text-[#5C635D] mb-1">位置：{finding.location}</p>
-                            )}
-                            <p className="text-[#5C635D] mb-1">问题：{finding.problem}</p>
-                            <p className="text-[#5C635D]">建议：{finding.suggestion}</p>
-                          </div>
-                        ))}
+                          );
+                        })}
                       </div>
                       <p className="text-[10px] text-[#5C635D] mt-2">
-                        提示：请在上方「编辑文稿」区域修改 Markdown，再点「重新导出 PDF」。
+                        建议流程：逐条「AI 修订该段落」→ 核对后「写回文稿」→ 全部处理完点「重新审核」看新分数 → 满意后「重新导出 PDF」。也可以直接在上方「编辑文稿」里手改。
                       </p>
                     </div>
                   )}

@@ -11,6 +11,33 @@ export interface ChangelogEntry {
 
 export const CHANGELOG: ChangelogEntry[] = [
   {
+    "hash": "c94a5c9",
+    "date": "2026-07-30",
+    "subject": "fix: cut manual duplication, README-derived description, line recount",
+    "details": [
+      "Generated manuals scored badly for three reasons, all addressed here:",
+      "Chapter continuation turns often re-emitted the chapter from its heading, and",
+      "the old code blindly concatenated, so a chapter could appear three times over.",
+      "Continuations are now merged: a restarted chapter is detected and either",
+      "replaced or section-deduped, echoed tails are trimmed, and a final pass keeps",
+      "one copy of each chapter and each section. The model is also told when a",
+      "chapter looks complete so it can stop instead of padding.",
+      "The manual prompt now forbids inventing languages, ports, version numbers and",
+      "script/executable names, which is what produced the KT/5432/install.sh",
+      "hallucinations. Each chapter receives the section outline written so far so",
+      "module names stay consistent across chapters.",
+      "项目描述 is distilled from the README by AI instead of copying GitHub's",
+      "one-line slogan; that field feeds metadata generation and every chapter.",
+      "AI 核对 is now available inside 编辑项目 and operates on the draft being edited,",
+      "with applied suggestions landing in the form rather than behind it.",
+      "源程序量 can be re-estimated on demand: samples files across the repo to",
+      "calibrate bytes-per-line instead of assuming a fixed 34.",
+      "Compliance term replacement extended to divination-flavoured module names",
+      "(八字/命理/风水/求签), and both review prompts now steer away from writing such",
+      "modules into 主要功能."
+    ]
+  },
+  {
     "hash": "57d6f28",
     "date": "2026-07-30",
     "subject": "feat: version badge with changelog; fix source line count",
