@@ -1,4 +1,5 @@
 #!/bin/sh
-# Auto-increment the patch version on every commit.
+# Auto-increment the patch version and refresh the in-app changelog on every commit.
 # Enabled via: git config core.hooksPath .githooks
 node scripts/bump-version.cjs || exit 1
+node scripts/gen-changelog.cjs || exit 1

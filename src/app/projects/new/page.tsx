@@ -11,6 +11,7 @@ import { getAIKey, createProject, createEmptyMeta, type SoftwareMeta } from "@/l
 import { fetchRepoBranches, fetchUserRepos, fetchRepoLanguages, type GitHubBranch, type GitHubRepo } from "@/lib/github";
 import { callAIForText, buildAutoNamePrompt, buildCategoryPrompt, buildTechCategoriesPrompt, sanitizeSoftCopyrightText } from "@/lib/ai-helpers";
 import { GIVEN_LANGUAGES, GIVEN_TECH_CATEGORIES, SOFTWARE_CATEGORIES, parseUserAgent, mapLinguistToGivenLanguages, describeLanguageStats } from "@/lib/utils";
+import VersionBadge from "@/components/VersionBadge";
 
 const PAGE_SIZE = 12;
 
@@ -196,10 +197,13 @@ function NewProjectContent() {
     <div className="flex flex-col min-h-screen">
       <header className="border-b border-[var(--color-border)] px-6 py-4">
         <div className="max-w-6xl mx-auto flex items-center justify-between">
-          <Link href="/" className="flex items-center gap-2">
-            <Logo />
-            <span className="text-lg font-semibold">软著通</span>
-          </Link>
+          <div className="flex items-center gap-2">
+            <Link href="/" className="flex items-center gap-2">
+              <Logo />
+              <span className="text-lg font-semibold">软著通</span>
+            </Link>
+            <VersionBadge />
+          </div>
           <Link href="/dashboard" className="text-sm text-[var(--color-muted)] hover:text-[var(--color-foreground)] transition-colors">返回控制台</Link>
         </div>
       </header>

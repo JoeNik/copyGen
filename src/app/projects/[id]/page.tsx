@@ -2,6 +2,7 @@
 import Logo from "@/components/Logo";
 import ConfirmDialog from "@/components/ConfirmDialog";
 import ErrorBoundary from "@/components/ErrorBoundary";
+import VersionBadge from "@/components/VersionBadge";
 
 
 import { useSession } from "next-auth/react";
@@ -435,7 +436,7 @@ function ProjectDetailContent() {
     startRun(projectId, async (emit): Promise<GenerationResult> => {
       // Step 0: Fetch files
       emit({ stepIndex: 0, currentStep: "正在读取仓库代码...", progress: 5 });
-      const { files, languages: langExts } = await fetchRepoFiles(
+      const { files, languages: langExts, totalSourceLines, readFileCount, codeFileCount } = await fetchRepoFiles(
         token, snapshot.repoOwner, snapshot.repoName, snapshot.branch,
         (msg, pct) => emit({ currentStep: msg, progress: pct })
       );
@@ -445,7 +446,11 @@ function ProjectDetailContent() {
       const languageStr = langExts.slice(0, 10).join(", ");
       const fileTree = files.slice(0, 50).map((f) => f.path).join("\n");
       const codeSummary = files.slice(0, 10).map((f) => `// ${f.path}\n${f.content.slice(0, 500)}`).join("\n\n").slice(0, 4000);
-      const totalSourceLines = files.reduce((sum, f) => sum + f.content.split("\n").length, 0);
+      if (codeFileCount > readFileCount) {
+        emit({
+          currentStep: `代码文件 ${codeFileCount} 个，已下载 ${readFileCount} 个；源程序量按仓库整体估算为 ${totalSourceLines} 行`,
+        });
+      }
 
       // Persist richer repo snapshot for AI 核对/审核 after page refresh, keeping
       // the README/moduleDirs captured during auto-detection.
@@ -1072,10 +1077,13 @@ function ProjectDetailContent() {
         <div className="max-w-6xl mx-auto flex items-center justify-between">
           {/* Navigation is safe during generation — the run lives outside this
               component and keeps going, so no interception here. */}
-          <Link href="/" className="flex items-center gap-2">
-            <Logo />
-            <span className="text-lg font-semibold">软著通</span>
-          </Link>
+          <div className="flex items-center gap-2">
+            <Link href="/" className="flex items-center gap-2">
+              <Logo />
+              <span className="text-lg font-semibold">软著通</span>
+            </Link>
+            <VersionBadge />
+          </div>
           <Link
             href="/dashboard"
             className="text-sm text-[var(--color-muted)] hover:text-[var(--color-foreground)] transition-colors"

@@ -9,9 +9,9 @@ import { SessionProvider } from "next-auth/react";
 import { useRouter } from "next/navigation";
 import { useEffect, useState, useMemo } from "react";
 import { getProjects, getAIKey, getActiveProvider, deleteProject, deleteProjects, type Project } from "@/lib/storage";
-import { APP_VERSION } from "@/lib/version";
 import AISettingsModal from "@/components/AISettingsModal";
 import ErrorBoundary from "@/components/ErrorBoundary";
+import VersionBadge from "@/components/VersionBadge";
 
 const statusConfig: Record<string, { label: string; color: string }> = {
   PENDING: { label: "待处理", color: "bg-zinc-500/20 text-zinc-400" },
@@ -120,11 +120,13 @@ function DashboardContent() {
     <div className="flex flex-col min-h-screen">
       <header className="border-b border-[var(--color-border)] px-6 py-4">
         <div className="max-w-6xl mx-auto flex items-center justify-between">
-          <Link href="/" className="flex items-center gap-2">
-            <Logo />
-            <span className="text-lg font-semibold">软著通</span>
-            <span className="text-xs text-[var(--color-muted)]">v{APP_VERSION}</span>
-          </Link>
+          <div className="flex items-center gap-2">
+            <Link href="/" className="flex items-center gap-2">
+              <Logo />
+              <span className="text-lg font-semibold">软著通</span>
+            </Link>
+            <VersionBadge />
+          </div>
           <div className="flex items-center gap-4">
             <button
               onClick={() => setShowSettings(true)}
