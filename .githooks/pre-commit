@@ -1,0 +1,4 @@
+#!/bin/sh
+# Auto-increment the patch version on every commit.
+# Enabled via: git config core.hooksPath .githooks
+node scripts/bump-version.cjs || exit 1

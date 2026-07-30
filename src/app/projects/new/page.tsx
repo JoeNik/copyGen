@@ -8,9 +8,9 @@ import { useRouter } from "next/navigation";
 import { useEffect, useState, useMemo, useCallback } from "react";
 import Link from "next/link";
 import { getAIKey, createProject, createEmptyMeta, type SoftwareMeta } from "@/lib/storage";
-import { fetchRepoBranches, fetchUserRepos, type GitHubBranch, type GitHubRepo } from "@/lib/github";
-import { callAIForText, buildAutoNamePrompt, buildCategoryPrompt, buildLanguagesPrompt, buildTechCategoriesPrompt, sanitizeSoftCopyrightText } from "@/lib/ai-helpers";
-import { GIVEN_LANGUAGES, GIVEN_TECH_CATEGORIES, SOFTWARE_CATEGORIES, parseUserAgent } from "@/lib/utils";
+import { fetchRepoBranches, fetchUserRepos, fetchRepoLanguages, type GitHubBranch, type GitHubRepo } from "@/lib/github";
+import { callAIForText, buildAutoNamePrompt, buildCategoryPrompt, buildTechCategoriesPrompt, sanitizeSoftCopyrightText } from "@/lib/ai-helpers";
+import { GIVEN_LANGUAGES, GIVEN_TECH_CATEGORIES, SOFTWARE_CATEGORIES, parseUserAgent, mapLinguistToGivenLanguages, describeLanguageStats } from "@/lib/utils";
 
 const PAGE_SIZE = 12;
 
@@ -33,6 +33,7 @@ function NewProjectContent() {
   const [submitting, setSubmitting] = useState(false);
   const [generatingName, setGeneratingName] = useState(false);
   const [generatingCategory, setGeneratingCategory] = useState(false);
+  const [languageHint, setLanguageHint] = useState("");
   const [error, setError] = useState("");
 
   const accessToken = (session as { accessToken?: string })?.accessToken;
@@ -69,6 +70,7 @@ function NewProjectContent() {
     setBranches([]);
     setSelectedBranch("");
     setError("");
+    setLanguageHint("");
     setCompletedAt(repo.pushed_at ? repo.pushed_at.slice(0, 10) : "");
 
     if (accessToken) {
@@ -119,20 +121,22 @@ function NewProjectContent() {
       .catch(() => {})
       .finally(() => setGeneratingCategory(false));
 
-    // Auto-detect languages
-    callAIForText(buildLanguagesPrompt(repo.name, repo.description || "", repo.language || ""))
-      .then((text) => {
-        const langs = text.split(",").map((s) => s.trim()).filter((s) => GIVEN_LANGUAGES.includes(s));
-        // Also auto-map from GitHub's primary language
-        const langMap: Record<string, string> = { TypeScript: "JavaScript", Kotlin: "Java", Scala: "Java", Dart: "C#", Rust: "C++", Shell: "Python", Bash: "Python", Vue: "JavaScript", Svelte: "JavaScript" };
-        const autoLang = langMap[repo.language || ""] || repo.language || "";
-        if (autoLang && GIVEN_LANGUAGES.includes(autoLang) && !langs.includes(autoLang)) langs.unshift(autoLang);
-        if (langs.length > 0) setMeta((prev) => ({ ...prev, languagesGiven: langs }));
-      })
-      .catch(() => {});
+    // Languages come from GitHub Linguist byte counts, not an AI guess off the
+    // repo name — the API is authoritative about what's actually in the repo.
+    if (accessToken) {
+      fetchRepoLanguages(accessToken, repo.owner.login, repo.name)
+        .then((stats) => {
+          const langs = mapLinguistToGivenLanguages(stats);
+          if (langs.length > 0) {
+            setMeta((prev) => ({ ...prev, languagesGiven: langs }));
+            setLanguageHint(describeLanguageStats(stats));
+          }
+        })
+        .catch(() => {});
+    }
 
     // Auto-detect tech categories — always must have at least one
-    callAIForText(buildTechCategoriesPrompt(repo.name, repo.description || "", repo.language || ""))
+    callAIForText(buildTechCategoriesPrompt(repo.name, repo.description || "", repo.language || ""), 300)
       .then((text) => {
         const cats = text.split(",").map((s) => s.trim()).filter((s) => GIVEN_TECH_CATEGORIES.includes(s));
         // Fallback: if no match, default to "应用软件" mapped into given categories
@@ -170,6 +174,7 @@ function NewProjectContent() {
       repoOwner: selectedRepo.owner.login,
       repoName: selectedRepo.name,
       repoUrl: selectedRepo.html_url,
+      repoDescription: selectedRepo.description || "",
       defaultBranch: selectedBranch.trim(),
       softwareName: softwareName.trim(),
       version,
@@ -331,6 +336,11 @@ function NewProjectContent() {
               {/* Programming languages - checkboxes */}
               <div>
                 <label className="block text-sm text-[var(--color-muted)] mb-2">编程语言（给定项）</label>
+                {languageHint && (
+                  <p className="text-xs text-[var(--color-muted)] mb-2">
+                    GitHub 语言统计：{languageHint}（已据此自动勾选，可修改）
+                  </p>
+                )}
                 <div className="flex flex-wrap gap-2">
                   {GIVEN_LANGUAGES.map((lang) => (
                     <button key={lang} onClick={() => toggleLanguage(lang)}

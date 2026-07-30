@@ -243,3 +243,53 @@ export const GIVEN_TECH_CATEGORIES = [
 ];
 
 export const SOFTWARE_CATEGORIES = ["应用软件", "嵌入式软件", "中间件", "操作系统"];
+
+// ── GitHub Linguist language → 软著登记「给定项」语言 ──
+
+/**
+ * The registration form only accepts a fixed list of languages, so Linguist names
+ * must be folded onto it. Mappings follow what the language compiles/transpiles to
+ * or is conventionally declared as in 软著 filings (e.g. TypeScript → JavaScript).
+ */
+const LINGUIST_TO_GIVEN: Record<string, string> = {
+  JavaScript: "JavaScript", TypeScript: "JavaScript", "Vue": "JavaScript",
+  Svelte: "JavaScript", CSS: "JavaScript", SCSS: "JavaScript", Less: "JavaScript",
+  HTML: "HTML", EJS: "HTML", Handlebars: "HTML", Pug: "HTML",
+  Python: "Python", Jupyter: "Python", "Jupyter Notebook": "Python",
+  Shell: "Python", PowerShell: "Python", Batchfile: "Python", Lua: "Python",
+  Java: "Java", Kotlin: "Java", Scala: "Java", Groovy: "Java", Clojure: "Java",
+  C: "C", "C++": "C++", "C#": "C#", Rust: "C++", Zig: "C++", Cuda: "C++",
+  "Objective-C": "Objective-C", "Objective-C++": "Objective-C",
+  Swift: "Swift", Dart: "C#", Go: "Go", PHP: "PHP", Ruby: "Ruby",
+  Perl: "Perl", R: "R", MATLAB: "MATLAB", SQL: "SQL", PLpgSQL: "PL/SQL",
+  TSQL: "PL/SQL", "PLSQL": "PL/SQL",
+  Assembly: "Assembly", "Visual Basic": "Visual Basic",
+  "Visual Basic .NET": "Visual Basic .Net", Pascal: "Delphi/Object Pascal",
+  Delphi: "Delphi/Object Pascal",
+};
+
+/**
+ * Fold Linguist language stats onto the registration form's fixed option list.
+ * Languages below `minRatio` of total bytes are dropped as incidental.
+ */
+export function mapLinguistToGivenLanguages(
+  stats: { name: string; ratio: number }[],
+  minRatio = 0.03
+): string[] {
+  const out: string[] = [];
+  for (const s of stats) {
+    if (s.ratio < minRatio) continue;
+    const mapped = LINGUIST_TO_GIVEN[s.name];
+    if (mapped && !out.includes(mapped)) out.push(mapped);
+  }
+  return out;
+}
+
+/** Human-readable language summary for AI prompts, e.g. "TypeScript 78%, CSS 12%". */
+export function describeLanguageStats(stats: { name: string; ratio: number }[]): string {
+  return stats
+    .filter((s) => s.ratio >= 0.01)
+    .slice(0, 8)
+    .map((s) => `${s.name} ${Math.round(s.ratio * 100)}%`)
+    .join(", ");
+}

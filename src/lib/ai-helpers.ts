@@ -51,11 +51,64 @@ export function sanitizeSoftCopyrightText(text: string): string {
   return next;
 }
 
+/**
+ * Send an AI request through the service-worker proxy (avoids CORS), falling back
+ * to a direct request when no worker is controlling the page — on a hard reload or
+ * the very first visit the SW may not have claimed the client yet, and hitting
+ * `/__ai_proxy__` unproxied returns the Next.js 404 HTML, which surfaced as an
+ * unexplained failure.
+ */
 async function proxyFetch(url: string, init: RequestInit): Promise<Response> {
-  return fetch("/__ai_proxy__", {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ targetUrl: url, method: init.method || "POST", headers: init.headers, body: init.body }),
+  const body = JSON.stringify({
+    targetUrl: url,
+    method: init.method || "POST",
+    headers: init.headers,
+    body: init.body,
+  });
+
+  const controlled =
+    typeof navigator !== "undefined" &&
+    "serviceWorker" in navigator &&
+    !!navigator.serviceWorker.controller;
+
+  if (controlled) {
+    const res = await fetch("/__ai_proxy__", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body,
+    });
+    // The proxy always tags its responses; anything else means the request escaped
+    // the worker (404 HTML from the app router) → retry directly.
+    if (res.headers.get("X-AI-Proxy") || res.status !== 404) return res;
+  }
+
+  return fetch(url, init);
+}
+
+/** Ensure the AI proxy worker is active before the first request of a batch. */
+export async function ensureAIProxyReady(timeoutMs = 3000): Promise<boolean> {
+  if (typeof navigator === "undefined" || !("serviceWorker" in navigator)) return false;
+  if (navigator.serviceWorker.controller) return true;
+  try {
+    await navigator.serviceWorker.ready;
+  } catch {
+    return false;
+  }
+  if (navigator.serviceWorker.controller) return true;
+
+  // `ready` resolves once registered, but control of an already-loaded page only
+  // arrives with controllerchange. Wait briefly, then fall back to direct fetch.
+  return new Promise<boolean>((resolve) => {
+    const timer = setTimeout(() => {
+      navigator.serviceWorker.removeEventListener("controllerchange", onChange);
+      resolve(!!navigator.serviceWorker.controller);
+    }, timeoutMs);
+    const onChange = () => {
+      clearTimeout(timer);
+      navigator.serviceWorker.removeEventListener("controllerchange", onChange);
+      resolve(true);
+    };
+    navigator.serviceWorker.addEventListener("controllerchange", onChange);
   });
 }
 
@@ -255,7 +308,11 @@ function splitSystemMessages(messages: { role: string; content: string }[]) {
   return { system, rest };
 }
 
-async function callAI(messages: { role: string; content: string }[], config: ProviderConfig): Promise<string> {
+async function callAI(
+  messages: { role: string; content: string }[],
+  config: ProviderConfig,
+  maxTokens = 200
+): Promise<string> {
   let url: string;
   let headers: Record<string, string>;
   let body: string;
@@ -263,7 +320,7 @@ async function callAI(messages: { role: string; content: string }[], config: Pro
   if (config.protocol === "openai") {
     url = openaiChatCompletionsUrl(config.baseUrl);
     headers = { "Content-Type": "application/json", Authorization: `Bearer ${config.apiKey}` };
-    body = JSON.stringify({ model: config.model, max_tokens: 200, messages });
+    body = JSON.stringify({ model: config.model, max_tokens: maxTokens, messages });
   } else if (config.protocol === "claude") {
     const { system, rest } = splitSystemMessages(messages);
     url = claudeMessagesUrl(config.baseUrl);
@@ -275,7 +332,7 @@ async function callAI(messages: { role: string; content: string }[], config: Pro
     };
     body = JSON.stringify({
       model: config.model,
-      max_tokens: 200,
+      max_tokens: maxTokens,
       ...(system ? { system } : {}),
       messages: rest,
     });
@@ -286,7 +343,7 @@ async function callAI(messages: { role: string; content: string }[], config: Pro
     const b = config.baseUrl.replace(/\/+$/, "");
     url = `${b}/v1beta/models/${config.model}:generateContent?key=${config.apiKey}`;
     headers = { "Content-Type": "application/json" };
-    body = JSON.stringify({ contents, generationConfig: { maxOutputTokens: 200 } });
+    body = JSON.stringify({ contents, generationConfig: { maxOutputTokens: maxTokens } });
   }
 
   const res = await proxyFetch(url, { method: "POST", headers, body });
@@ -298,7 +355,12 @@ async function callAI(messages: { role: string; content: string }[], config: Pro
   return text.trim();
 }
 
-export async function callAIForText(prompt: string): Promise<string> {
+/**
+ * Short-answer AI call. `maxTokens` defaults to 200 for one-line answers (name,
+ * category); pass a larger budget for JSON payloads — 200 tokens truncates a
+ * six-field Chinese JSON object mid-string and the parse silently fails.
+ */
+export async function callAIForText(prompt: string, maxTokens = 200): Promise<string> {
   const active = getActiveProvider();
   if (!active) throw new Error("请先在设置中配置并启用一个 AI 提供商");
   const config: ProviderConfig = {
@@ -307,7 +369,7 @@ export async function callAIForText(prompt: string): Promise<string> {
     baseUrl: active.baseUrl || getAIBaseUrl(),
     model: active.model || getAIModel(),
   };
-  return callAI([{ role: "user", content: prompt }], config);
+  return callAI([{ role: "user", content: prompt }], config, maxTokens);
 }
 
 /**
@@ -379,11 +441,21 @@ const META_FIELD_LABELS: Record<string, string> = {
   domain: "面向领域/行业",
   mainFeatures: "主要功能",
   technicalFeatures: "技术特点",
+  softwareDescription: "软件说明",
   runPlatform: "运行平台",
   runSupport: "运行支撑环境",
   devTools: "开发工具",
-  languagesGiven: "编程语言",
+  devHardware: "开发硬件环境",
+  runHardware: "运行硬件环境",
+  devOS: "开发操作系统",
+  languagesGiven: "编程语言（给定项）",
+  languagesExtra: "编程语言（补充项）",
+  techCategoriesGiven: "技术特点分类",
+  techCategoriesExtra: "技术特点（补充）",
   sourceLines: "源程序行数",
+  originalType: "原创/修改",
+  devMethod: "开发方式",
+  publishStatus: "发表状态",
 };
 
 export function buildMetaReviewPrompt(input: {
@@ -393,23 +465,33 @@ export function buildMetaReviewPrompt(input: {
   repoDescription: string;
   languages: string;
   fileTree: string;
+  readme?: string;
+  moduleDirs?: string;
   meta: Record<string, unknown>;
 }): string {
   return `你是中国计算机软件著作权登记材料的审核专家。下面是一个软件项目的登记信息，请逐项核对是否存在填写错误、前后矛盾、与仓库实际情况不符、或不符合软著登记规范的地方。
 
 判断依据：
-- 只依据下方提供的仓库名称、描述、编程语言、目录结构等客观事实，不要凭空想象仓库里没有的东西。
+- 只依据下方提供的 README、语言统计、目录结构等客观事实，不要凭空想象仓库里没有的东西。
 - 软件全称应以“软件”“系统”“平台”等结尾，不含版本号；版本号形如 V1.0。
-- 运行平台/运行支撑环境应与编程语言、目录结构一致（例如 Node/前端项目不应写成仅 Windows 桌面 exe）。
-- 开发目的、主要功能、技术特点应彼此一致，且与仓库描述、目录结构相符。
+- 运行平台/运行支撑环境/编程语言应与语言统计、依赖清单一致（例如 Node/前端项目不应写成仅 Windows 桌面 exe）。这几项不一致是形式审查能发现的硬问题，优先级最高。
+- 开发目的、主要功能、技术特点应彼此一致，且与 README、目录结构不矛盾。
+- 软著登记材料本身使用概括性的常规表述，这是正常的：只要功能项对应本项目确实具备的能力，就不要因为“不够详细”而报问题。仅当功能项明显与本项目无关（写了本项目根本没有的能力），或通篇与仓库实际情况脱节时，才提出问题。
 - 若某字段看起来合理、无需修改，就不要为它编造问题。
 ${SOFT_COPYRIGHT_COMPLIANCE_RULES}
 
 仓库名称：${input.repoName}
-仓库描述：${input.repoDescription || "无"}
-编程语言：${input.languages || "未知"}
-目录结构（节选）：
-${input.fileTree.slice(0, 2000)}
+仓库地址/描述：${input.repoDescription || "无"}
+语言统计（按代码字节占比）：${input.languages || "未知"}
+
+README（节选）：
+${input.readme ? input.readme.slice(0, 3500) : "（无 README）"}
+
+目录结构（模块划分）：
+${(input.moduleDirs || input.fileTree).slice(0, 1500)}
+
+代表性源文件：
+${input.fileTree.slice(0, 1200)}
 
 当前填写的登记信息（JSON）：
 ${JSON.stringify({ softwareName: input.softwareName, version: input.version, ...input.meta }, null, 2)}
@@ -418,10 +500,10 @@ ${JSON.stringify({ softwareName: input.softwareName, version: input.version, ...
 {
   "issues": [
     {
-      "field": "上面 JSON 中的字段英文 key（如 purpose、runPlatform、softwareName）",
+      "field": "上面 JSON 中的字段英文 key（如 purpose、runPlatform、softwareName、mainFeatures）",
       "severity": "high | medium | low",
       "problem": "该字段现在的问题（一句话）",
-      "suggestion": "建议修改为的具体内容"
+      "suggestion": "建议修改为的具体内容（直接给可用的最终文本，不要写“建议改为…”这类前缀）"
     }
   ],
   "overallComment": "对整体填写质量的一句话总评"
@@ -435,11 +517,14 @@ export async function reviewProjectMeta(input: {
   repoDescription: string;
   languages: string;
   fileTree: string;
+  readme?: string;
+  moduleDirs?: string;
   meta: Record<string, unknown>;
 }): Promise<MetaReviewResult> {
-  const { text } = await callAILong([
-    { role: "user", content: buildMetaReviewPrompt(input) },
-  ]);
+  const text = await callAILongJSON(
+    [{ role: "user", content: buildMetaReviewPrompt(input) }],
+    "AI 核对"
+  );
   const parsed = extractJsonObject(text);
   if (!parsed) {
     throw new Error("AI 未返回可解析的核对结果，请重试");
@@ -510,6 +595,8 @@ ${SOFT_COPYRIGHT_COMPLIANCE_RULES}
 
 审核原则：
 - 只依据下方提供的客观信息判断“是否编造”，如果文档写了下方信息里完全没有依据的具体功能/模块/错误码，判为疑似幻觉。
+- 软著说明书使用概括、程式化的表述属于正常且符合惯例，不要因为“不够详细/不够独特”而扣分或报问题。审核重点是内部矛盾与凭空编造，不是文采或信息密度。
+- 章节之间的自相矛盾（例如第五章的模块名与第六、七章不对应）比表述笼统严重得多，应优先指出。
 - 不要自己臆造问题；无法确定的从轻。
 - score（文档质量）与 passProbability（软著初步通过概率）都用 0–100 整数。
 
@@ -560,9 +647,10 @@ export async function auditManualMarkdown(input: {
   codeSummary: string;
   markdown: string;
 }): Promise<ManualAuditResult> {
-  const { text } = await callAILong([
-    { role: "user", content: buildManualAuditPrompt(input) },
-  ]);
+  const text = await callAILongJSON(
+    [{ role: "user", content: buildManualAuditPrompt(input) }],
+    "AI 审核"
+  );
   const parsed = extractJsonObject(text);
   if (!parsed) {
     throw new Error("AI 未返回可解析的审核结果，请重试");
@@ -620,19 +708,6 @@ export function buildCategoryPrompt(repoName: string, description: string, langu
 主要语言：${language || "未知"}`;
 }
 
-export function buildLanguagesPrompt(repoName: string, description: string, language: string): string {
-  return `根据以下 GitHub 仓库信息，判断该软件使用了哪些编程语言。
-从以下选项中选择所有适用的（逗号分隔返回），不要返回选项之外的内容：
-
-Assembly, C, C#, C++, Delphi/Object Pascal, Go, HTML, Java, JavaScript, MATLAB, Objective-C, PHP, PL/SQL, Perl, Python, R, Ruby, SQL, Swift, Visual Basic, Visual Basic .Net
-
-仓库名称：${repoName}
-仓库描述：${description || "无"}
-主要语言：${language || "未知"}
-
-只返回选中的语言名称，逗号分隔，不要返回其他内容。`;
-}
-
 export function buildTechCategoriesPrompt(repoName: string, description: string, language: string): string {
   return `根据以下 GitHub 仓库信息，判断该软件属于哪些技术特点分类。
 从以下选项中选择所有适用的（逗号分隔返回），不要返回选项之外的内容：
@@ -646,34 +721,148 @@ APP, 游戏软件, 教育软件, 金融软件, 医疗软件, 地理信息软件,
 只返回选中的分类名称，逗号分隔，不要返回其他内容。如果没有匹配的，返回"应用软件"。`;
 }
 
-export function buildMetadataPrompt(
-  repoName: string,
-  description: string,
-  languages: string,
-  fileTree: string,
-  codeSummary: string
-): string {
-  return `根据以下 GitHub 仓库信息，返回 JSON 格式的软件元数据。只返回 JSON，不要其他内容。
+export interface MetadataPromptInput {
+  repoName: string;
+  repoDescription: string;
+  /** Human-readable Linguist breakdown, e.g. "TypeScript 78%, CSS 12%" */
+  languageStats: string;
+  /** Mapped 软著 given-list languages already selected */
+  givenLanguages: string;
+  /** README content (truncated) */
+  readme: string;
+  /** Dependency manifests */
+  manifests: { path: string; content: string }[];
+  /** Directory layout at depth 1–2 */
+  moduleDirs: string[];
+  /** Representative source paths */
+  sourcePaths: string[];
+  /** Detected build/dev tooling */
+  devTools: string;
+}
+
+/**
+ * Metadata prompt: grounded but conventional.
+ *
+ * README + manifests are included so 运行平台/运行支撑环境/编程语言 match reality —
+ * those are the fields a 形式审查 can catch as internally inconsistent. The
+ * descriptive fields deliberately stay in standard 软著 register: 4–6 功能要点 in
+ * the conventional "XX管理/XX处理" shape, just named after what this project
+ * actually does. Over-specific feature lists make the chapter-by-chapter manual
+ * harder to keep self-consistent, which is a worse failure than mild generality.
+ */
+export function buildMetadataPrompt(input: MetadataPromptInput): string {
+  const manifestBlock = input.manifests.length
+    ? input.manifests
+        .map((m) => `--- ${m.path} ---\n${m.content.slice(0, 1800)}`)
+        .join("\n\n")
+    : "（无依赖清单）";
+
+  return `你是中国软件著作权登记材料撰写专家。请根据下面这个真实代码仓库的信息，填写软著登记所需的软件元数据。
+
+写作要求：
+- 采用软著登记材料的常规表述风格：正式、概括、面向功能，不写营销语言，不写具体代码实现细节。
+- 「主要功能」写 4-6 条，每条为「XX管理」「XX处理」「XX生成」这类标准功能项表述，用分号分隔；功能项的名称要对应本项目实际具备的能力（从 README 与目录结构判断），不要套用与本项目无关的通用条目。
+- 「运行平台」「运行支撑环境」「编程语言」必须与实际技术栈一致（依据依赖清单中的运行时与版本），这几项如与实际不符会在形式审查中被发现。
+- 「开发目的」1-2 句，说明本软件面向的问题与目标，保持概括。
+- 「技术特点」2-3 句，说明总体技术方案与架构层次，不需要列举具体库名。
+- 不要编造仓库中没有依据的功能模块、平台或依赖。
 ${SOFT_COPYRIGHT_COMPLIANCE_RULES}
 
-仓库名称：${repoName}
-仓库描述：${description || "无"}
-编程语言：${languages}
-目录结构：
-${fileTree}
+## 仓库基本信息
+名称：${input.repoName}
+描述：${input.repoDescription || "无"}
+GitHub 语言统计（按代码字节占比）：${input.languageStats || "未知"}
+软著登记语言（已映射）：${input.givenLanguages || "未确定"}
+检测到的开发工具：${input.devTools || "未检测到"}
 
-代码摘要：
-${codeSummary}
+## README（说明项目用途）
+${input.readme ? input.readme.slice(0, 5000) : "（该仓库没有 README）"}
 
-返回以下 JSON（每个字段用简洁的中文填写）：
+## 依赖清单（用于判断运行环境与技术栈）
+${manifestBlock}
+
+## 目录结构（模块划分）
+${input.moduleDirs.join("\n").slice(0, 1500)}
+
+## 代表性源文件
+${input.sourcePaths.slice(0, 60).join("\n").slice(0, 1500)}
+
+只返回如下 JSON，不要输出解释、不要代码围栏：
 {
-  "runPlatform": "该软件的运行平台/操作系统",
-  "runSupport": "软件运行支撑环境/支持软件（如 Node.js 18+, Python 3.10+ 等）",
-  "purpose": "开发目的（1-2句话）",
+  "runPlatform": "运行平台/操作系统，需与技术栈一致",
+  "runSupport": "运行支撑环境，写明运行时及版本（如 Node.js 18+、Python 3.10+、JDK 17）",
+  "purpose": "开发目的（1-2句，概括）",
   "domain": "面向领域/行业",
-  "mainFeatures": "软件的主要功能（3-5个要点，用分号分隔）",
-  "technicalFeatures": "软件的技术特点（2-3句话）"
+  "mainFeatures": "主要功能，4-6条标准功能项表述，分号分隔",
+  "technicalFeatures": "技术特点，总体技术方案与架构（2-3句）",
+  "softwareDescription": "软件整体说明（2-3句，用于登记表「软件说明」栏）"
 }`;
+}
+
+/**
+ * Pick the registration form's 技术特点分类 using real repo evidence rather than
+ * just the repo name and primary language.
+ */
+export function buildTechCategoriesFromInsightsPrompt(input: {
+  repoName: string;
+  repoDescription: string;
+  readme: string;
+  moduleDirs: string[];
+  languageStats: string;
+}): string {
+  return `根据下面这个真实代码仓库的信息，判断该软件属于哪些「技术特点分类」。
+只能从以下固定选项中选择（逗号分隔），不要返回选项之外的内容：
+
+APP, 游戏软件, 教育软件, 金融软件, 医疗软件, 地理信息软件, 云计算软件, 信息安全软件, 大数据软件, 人工智能软件, VR软件, 5G软件, 小程序, 物联网软件, 智慧城市软件
+
+判断依据要来自实际内容，不要仅凭名字猜测。若该项目调用了大模型/AI 接口，可选「人工智能软件」；若是 Web 服务/后端，可选「云计算软件」；若确实都不沾，返回 APP。
+
+仓库名称：${input.repoName}
+仓库描述：${input.repoDescription || "无"}
+语言统计：${input.languageStats || "未知"}
+README（节选）：
+${input.readme.slice(0, 2500) || "（无）"}
+目录结构：
+${input.moduleDirs.join("\n").slice(0, 1000)}
+
+只返回选中的分类名称，逗号分隔，不要返回其他内容。`;
+}
+
+export interface GeneratedMetadata {
+  runPlatform: string;
+  runSupport: string;
+  purpose: string;
+  domain: string;
+  mainFeatures: string;
+  technicalFeatures: string;
+  softwareDescription: string;
+}
+
+/**
+ * Generate registration metadata from repo insights. Uses the long-form endpoint
+ * with a real token budget — the previous 200-token short call truncated the JSON
+ * and the failure was swallowed, leaving fields blank or generic.
+ */
+export async function generateProjectMetadata(
+  input: MetadataPromptInput
+): Promise<GeneratedMetadata | null> {
+  const text = await callAILongJSON(
+    [{ role: "user", content: buildMetadataPrompt(input) }],
+    "AI 元数据生成"
+  );
+  const parsed = extractJsonObject(text);
+  if (!parsed) return null;
+  const pick = (k: string) =>
+    typeof parsed[k] === "string" ? sanitizeSoftCopyrightText(String(parsed[k])) : "";
+  return {
+    runPlatform: pick("runPlatform"),
+    runSupport: pick("runSupport"),
+    purpose: pick("purpose"),
+    domain: pick("domain"),
+    mainFeatures: pick("mainFeatures"),
+    technicalFeatures: pick("technicalFeatures"),
+    softwareDescription: pick("softwareDescription"),
+  };
 }
 
 // ── Long-form AI for manual generation ──
@@ -737,6 +926,42 @@ export async function callAILong(messages: { role: string; content: string }[]):
     throw new Error(`AI API 错误 (${res.status}): ${err.slice(0, 200)}`);
   }
   return parseAIResponse(res, config.protocol);
+}
+
+/**
+ * `callAILong` for one-shot JSON requests (核对 / 审核), with the same retry policy
+ * the manual generator uses. A single transient network blip previously surfaced to
+ * the user as a bare "Failed to fetch".
+ */
+async function callAILongJSON(
+  messages: { role: string; content: string }[],
+  label: string
+): Promise<string> {
+  await ensureAIProxyReady();
+  const MAX_RETRIES = 2;
+  let lastError: unknown;
+
+  for (let retry = 0; retry <= MAX_RETRIES; retry++) {
+    try {
+      if (retry > 0) await sleep(Math.min(8000, 1500 * 2 ** (retry - 1)));
+      const { text } = await callAILong(messages);
+      if (text.trim()) return text;
+      lastError = new Error(`${label}返回空内容`);
+    } catch (e) {
+      lastError = e;
+      const msg = e instanceof Error ? e.message : String(e);
+      // Auth failures and explicit API errors won't fix themselves.
+      if (/AI API 错误 \((400|401|403|404|422)\)/i.test(msg)) break;
+    }
+  }
+
+  const msg = lastError instanceof Error ? lastError.message : String(lastError);
+  if (/failed to fetch|networkerror|load failed/i.test(msg)) {
+    throw new Error(
+      `${label}请求失败：无法连接 AI 接口。请检查网络、API 地址是否可访问（若使用反向代理请确认其允许跨域），然后重试。`
+    );
+  }
+  throw new Error(`${label}失败：${msg}`);
 }
 
 function countNonEmptyLines(text: string): number {
@@ -896,11 +1121,12 @@ ${codeSummary.slice(0, 3000)}`;
   const systemPrompt = `你是中国软件著作权「文档鉴别材料/操作说明书」撰写专家。
 规则：
 1. 只输出 Markdown 正文，不要输出目录，不要输出 JSON，不要用代码围栏包裹全文
-2. 使用正式中文说明文风，内容具体可操作，避免空话套话
+2. 使用正式中文说明文风，面向操作、条理清晰；采用软著说明书的常规程式化表述即可，不需要追求独特文采
 3. 一级标题必须使用给定的章节标题（以 # 开头）
 4. 可用 ## / ### 作为小节；图片用 [图章号-序号：描述] 占位
 5. 本请求只写当前这一章，不要写其他章，不要重复已写章节
 6. 一次尽量写完整、详实（目标约 200–400 行文档），不要只写一两百字就结束
+7. 功能模块、界面元素、错误码等具名内容必须与「软件信息」中的主要功能保持一致，全文前后统一；不要引入软件信息里没有提到的模块名，否则各章之间会互相矛盾
 ${SOFT_COPYRIGHT_COMPLIANCE_RULES}`;
 
   let allText = opts.resumeMarkdown || "";

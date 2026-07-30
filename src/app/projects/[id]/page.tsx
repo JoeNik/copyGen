@@ -1,22 +1,37 @@
 "use client";
 import Logo from "@/components/Logo";
+import ConfirmDialog from "@/components/ConfirmDialog";
 
 
 import { useSession } from "next-auth/react";
 import { SessionProvider } from "next-auth/react";
 import { useRouter, useParams } from "next/navigation";
-import { useEffect, useState, useCallback, useRef } from "react";
+import { useEffect, useState, useCallback } from "react";
 import Link from "next/link";
 import { getProject, updateProject, getAIKey, getManualDraft, saveManualDraft, clearManualDraft, type Project, type SoftwareMeta, type ManualDraft } from "@/lib/storage";
-import { fetchRepoBranches, fetchRepoFiles, fetchRepoStats, type GitHubBranch } from "@/lib/github";
-import { generateManualMarkdown, callAIForText, buildMetadataPrompt, sanitizeSoftCopyrightText, reviewProjectMeta, auditManualMarkdown, type MetaReviewResult, type ManualAuditResult } from "@/lib/ai-helpers";
+import { fetchRepoBranches, fetchRepoFiles, fetchRepoStats, fetchRepoLanguages, fetchRepoInsights, fetchRepo, type GitHubBranch } from "@/lib/github";
+import { generateManualMarkdown, callAIForText, generateProjectMetadata, sanitizeSoftCopyrightText, reviewProjectMeta, auditManualMarkdown, buildTechCategoriesFromInsightsPrompt, type MetaReviewResult, type ManualAuditResult } from "@/lib/ai-helpers";
 import { generateCodePDF } from "@/lib/docgen/code-pdf";
 import { generateManualPDF } from "@/lib/docgen/manual-pdf";
-import { parseUserAgent, detectDevTools } from "@/lib/utils";
+import { parseUserAgent, detectDevTools, mapLinguistToGivenLanguages, describeLanguageStats, GIVEN_LANGUAGES, GIVEN_TECH_CATEGORIES, SOFTWARE_CATEGORIES } from "@/lib/utils";
+import {
+  startRun,
+  subscribeToRun,
+  getRun,
+  isRunning,
+  takeFinishedRun,
+  forgetRun,
+  type GenerationResult,
+} from "@/lib/generation-runtime";
 
 const steps = ["读取仓库代码", "分析代码结构", "AI 生成元数据", "生成程序鉴别材料", "生成文档鉴别材料", "完成"];
 
-/** Mark a project as interrupted so reopen shows resume UI instead of stuck "准备中". */
+/**
+ * Mark a project as interrupted so reopen shows resume UI instead of stuck "准备中".
+ *
+ * Only call this when the run is genuinely gone (tab closed / reloaded). An SPA
+ * navigation does NOT end the run — see `generation-runtime`.
+ */
 function markGenerationInterrupted(projectId: string): { project: Project; draft: ManualDraft | null; message: string } | null {
   const p = getProject(projectId);
   if (!p || p.status !== "PROCESSING") return null;
@@ -75,6 +90,7 @@ function ProjectDetailContent() {
   const [stepIndex, setStepIndex] = useState(-1);
   const [error, setError] = useState("");
   const [metaReady, setMetaReady] = useState(false);
+  const [detectStatus, setDetectStatus] = useState("");
   const [codePdfUrl, setCodePdfUrl] = useState<string | null>(null);
   const [manualPdfUrl, setManualPdfUrl] = useState<string | null>(null);
   const [manualDraft, setManualDraft] = useState<ManualDraft | null>(null);
@@ -82,12 +98,15 @@ function ProjectDetailContent() {
   const [editingManual, setEditingManual] = useState(false);
   const [reexporting, setReexporting] = useState(false);
   const [editingProject, setEditingProject] = useState(false);
-  const [projectDraft, setProjectDraft] = useState({ softwareName: "", version: "", completedAt: "", branch: "" });
+  const [projectDraft, setProjectDraft] = useState({ softwareName: "", version: "", completedAt: "", branch: "", repoDescription: "" });
+  /** Full metadata copy edited inside 「编辑项目」 so creation-time values are correctable. */
+  const [metaDraft, setMetaDraft] = useState<SoftwareMeta | null>(null);
   const [forceRegenerate, setForceRegenerate] = useState(false);
   const [branches, setBranches] = useState<GitHubBranch[]>([]);
   const [loadingBranches, setLoadingBranches] = useState(false);
   const [branchesLoadAttempted, setBranchesLoadAttempted] = useState(false);
   const [savingProject, setSavingProject] = useState(false);
+  const [refreshingRepoDesc, setRefreshingRepoDesc] = useState(false);
 
   // AI 核对项目信息 / 审核说明书
   const [metaReview, setMetaReview] = useState<MetaReviewResult | null>(null);
@@ -98,11 +117,14 @@ function ProjectDetailContent() {
   const [auditingManual, setAuditingManual] = useState(false);
   const [auditError, setAuditError] = useState("");
 
-  // Track live generation so unmount/close can flip PROCESSING → FAILED.
-  const generatingRef = useRef(false);
-  useEffect(() => {
-    generatingRef.current = generating;
-  }, [generating]);
+  /** Pending action awaiting二次确认 (guards misclicks during/after generation). */
+  const [pendingConfirm, setPendingConfirm] = useState<{
+    title: string;
+    message: string;
+    confirmLabel: string;
+    destructive?: boolean;
+    run: () => void;
+  } | null>(null);
 
   const accessToken = (session as { accessToken?: string })?.accessToken;
 
@@ -120,10 +142,13 @@ function ProjectDetailContent() {
       const p = getProject(projectId);
       if (!p) { router.push("/dashboard"); return; }
 
-      // Generation only runs in this tab's memory. A leftover PROCESSING status
-      // means the previous session was closed/refreshed mid-run — recover to FAILED
-      // so the resume / restart UI is shown instead of endless "准备中...".
-      if (p.status === "PROCESSING") {
+      const liveRun = getRun(projectId);
+
+      // A PROCESSING project with no live run in this tab means the run really is
+      // gone (tab was closed or reloaded) — recover to FAILED so the resume UI
+      // shows instead of an endless "准备中...". If a run IS live, leave the status
+      // alone and re-attach below; the work is still progressing.
+      if (p.status === "PROCESSING" && !liveRun) {
         const recovered = markGenerationInterrupted(projectId);
         if (recovered) {
           setProject(recovered.project);
@@ -135,6 +160,7 @@ function ProjectDetailContent() {
             version: recovered.project.version,
             completedAt: recovered.project.completedAt || "",
             branch: recovered.project.defaultBranch,
+            repoDescription: recovered.project.repoDescription || "",
           });
           setManualDraft(recovered.draft);
           if (recovered.project.manualMarkdown) setManualMarkdown(recovered.project.manualMarkdown);
@@ -153,29 +179,49 @@ function ProjectDetailContent() {
         version: p.version,
         completedAt: p.completedAt || "",
         branch: p.defaultBranch,
+        repoDescription: p.repoDescription || "",
       });
       setManualDraft(getManualDraft(projectId));
       if (p.manualMarkdown) setManualMarkdown(p.manualMarkdown);
-      // DONE / FAILED already have meta; skip auto-detect spinner on reopen
-      if (p.status === "DONE" || p.status === "FAILED") setMetaReady(true);
+      // Re-attach to a run that survived navigation: restore its live progress
+      // rather than showing a stale/idle view.
+      if (liveRun?.status === "running") {
+        setGenerating(true);
+        setStepIndex(liveRun.progress.stepIndex);
+        setProgress(liveRun.progress.progress);
+        setCurrentStep(liveRun.progress.currentStep);
+        setMetaReady(true);
+      } else if (p.status === "DONE" || p.status === "FAILED") {
+        // DONE / FAILED already have meta; skip auto-detect spinner on reopen
+        setMetaReady(true);
+      }
     };
     void loadProject();
     return () => { active = false; };
   }, [projectId, session, router]);
 
-  // If user navigates away / closes tab while generating, persist interrupted state.
+  // Only a real page teardown (close / reload) kills the run. SPA unmount does
+  // not — the promise lives in `generation-runtime`, so no recovery on unmount.
   useEffect(() => {
     const onLeave = () => {
-      if (!generatingRef.current) return;
+      if (!isRunning(projectId)) return;
       markGenerationInterrupted(projectId);
     };
+    // Native browser prompt is the only thing that can stop a reload/close; the
+    // in-app dialog cannot intercept it. Do NOT mark interrupted here — the user
+    // may cancel the unload and generation continues. `pagehide` fires only when
+    // the page is actually going away, so recovery is recorded there.
+    const onBeforeUnload = (e: BeforeUnloadEvent) => {
+      if (!isRunning(projectId)) return;
+      e.preventDefault();
+      e.returnValue = "";
+      return "";
+    };
     window.addEventListener("pagehide", onLeave);
-    window.addEventListener("beforeunload", onLeave);
+    window.addEventListener("beforeunload", onBeforeUnload);
     return () => {
       window.removeEventListener("pagehide", onLeave);
-      window.removeEventListener("beforeunload", onLeave);
-      // SPA navigation unmount: same recovery so dashboard doesn't stay "生成中"
-      if (generatingRef.current) markGenerationInterrupted(projectId);
+      window.removeEventListener("beforeunload", onBeforeUnload);
     };
   }, [projectId]);
 
@@ -185,12 +231,15 @@ function ProjectDetailContent() {
 
     const detectMeta = async () => {
       const { os, cores, memory } = parseUserAgent();
-      setMeta((prev) => prev ? {
-        ...prev,
+      // Accumulate detected values locally so persistence never relies on a side
+      // effect inside a state updater (StrictMode invokes updaters twice).
+      let next: SoftwareMeta = {
+        ...project.meta,
         devHardware: `PC, ${os}, ${cores}核CPU, ${memory}GB内存`,
         runHardware: `PC, ${os}, ${cores}核CPU, ${memory}GB内存`,
         devOS: os,
-      } : prev);
+      };
+      setMeta(next);
 
       if (!project.defaultBranch.trim()) {
         setError("项目未指定代码分支，请重新创建项目并选择分支");
@@ -199,67 +248,116 @@ function ProjectDetailContent() {
       }
 
       try {
-        // Lightweight: only fetch tree, no file content
-        const { allFilePaths, languages, estimatedLines } = await fetchRepoStats(
+        setDetectStatus("正在读取仓库文件树...");
+        const { allFilePaths, estimatedLines } = await fetchRepoStats(
           accessToken, project.repoOwner, project.repoName, project.defaultBranch
         );
 
         const devTools = detectDevTools(allFilePaths);
 
-        // Auto-select matching given languages
-        // fetchRepoStats returns uppercase extensions: "JS", "PY", "TSX", etc.
-        const extToGiven: Record<string, string> = {
-          JS: "JavaScript", TS: "JavaScript", JSX: "JavaScript", TSX: "JavaScript",
-          PY: "Python", JAVA: "Java", C: "C", CPP: "C++", "C++": "C++", "C#": "C#", CS: "C#",
-          GO: "Go", RS: "C++", RB: "Ruby", PHP: "PHP", SWIFT: "Swift",
-          KT: "Java", SCALA: "Java", DART: "C#",
-          SQL: "SQL", R: "R", PERL: "Perl", LUA: "Python",
-          HTML: "HTML", CSS: "JavaScript", VUE: "JavaScript", SVELTE: "JavaScript",
-          SH: "Python", BASH: "Python", ASM: "Assembly",
-          VB: "Visual Basic", VBS: "Visual Basic",
-        };
-
-        const autoLangs = new Set<string>();
-        for (const lang of languages) {
-          const mapped = extToGiven[lang.toUpperCase()] || extToGiven[lang];
-          if (mapped) autoLangs.add(mapped);
+        // Backfill the repo description for projects created before it was stored.
+        let repoDescription = project.repoDescription || "";
+        if (!repoDescription) {
+          try {
+            const repoInfo = await fetchRepo(accessToken, project.repoOwner, project.repoName);
+            repoDescription = repoInfo.description || "";
+            if (repoDescription) updateProject(projectId, { repoDescription });
+          } catch { /* description is optional context */ }
         }
 
-        setMeta((prev) => prev ? {
-          ...prev,
+        // GitHub Linguist byte-weighted stats beat extension counting: it ignores
+        // vendored/generated files and reflects real code volume.
+        setDetectStatus("正在获取语言统计...");
+        const langStats = await fetchRepoLanguages(accessToken, project.repoOwner, project.repoName);
+        const givenLangs = mapLinguistToGivenLanguages(langStats);
+        const languageStatsText = describeLanguageStats(langStats);
+
+        next = {
+          ...next,
           devTools,
-          languagesGiven: Array.from(autoLangs),
+          languagesGiven: givenLangs.length ? givenLangs : next.languagesGiven,
           sourceLines: estimatedLines,
-        } : prev);
+        };
+        setMeta(next);
 
-        // Use tree paths for AI metadata — no file content download needed
-        const fileTree = allFilePaths.slice(0, 50).join("\n");
-        const languageStr = languages.slice(0, 5).join(", ");
-
-        const aiResult = await callAIForText(
-          buildMetadataPrompt(project.repoName, project.repoUrl, languageStr, fileTree, "")
+        // README + manifests + module layout — this is what makes 开发目的/主要功能
+        // specific rather than boilerplate.
+        setDetectStatus("正在读取 README 与依赖清单...");
+        const insights = await fetchRepoInsights(
+          accessToken, project.repoOwner, project.repoName, project.defaultBranch, allFilePaths
         );
 
-        try {
-          const match = aiResult.match(/\{[\s\S]*\}/);
-          if (match) {
-            const parsed = JSON.parse(match[0]);
-            setMeta((prev) => prev ? {
-              ...prev,
-              runPlatform: typeof parsed.runPlatform === "string" ? sanitizeSoftCopyrightText(parsed.runPlatform) : prev.runPlatform,
-              runSupport: typeof parsed.runSupport === "string" ? sanitizeSoftCopyrightText(parsed.runSupport) : prev.runSupport,
-              purpose: typeof parsed.purpose === "string" ? sanitizeSoftCopyrightText(parsed.purpose) : prev.purpose,
-              domain: typeof parsed.domain === "string" ? sanitizeSoftCopyrightText(parsed.domain) : prev.domain,
-              mainFeatures: typeof parsed.mainFeatures === "string" ? sanitizeSoftCopyrightText(parsed.mainFeatures) : prev.mainFeatures,
-              technicalFeatures: typeof parsed.technicalFeatures === "string" ? sanitizeSoftCopyrightText(parsed.technicalFeatures) : prev.technicalFeatures,
-            } : prev);
-          }
-        } catch { /* AI response not JSON, skip */ }
-
+        // Persist context immediately so 「AI 核对」 works before any generation run.
         updateProject(projectId, {
-          meta: { ...getProject(projectId)!.meta, devTools, languagesGiven: Array.from(autoLangs), sourceLines: estimatedLines },
+          reviewContext: {
+            fileTree: insights.sourcePaths.slice(0, 60).join("\n"),
+            languages: languageStatsText || givenLangs.join(", "),
+            codeSummary: insights.manifests
+              .map((m) => `--- ${m.path} ---\n${m.content.slice(0, 1200)}`)
+              .join("\n\n"),
+            readme: insights.readme.slice(0, 4000),
+            moduleDirs: insights.moduleDirs.join("\n").slice(0, 2000),
+          },
         });
-      } catch { /* fetch failed, skip */ }
+
+        setDetectStatus("AI 正在分析项目用途与功能...");
+        const generated = await generateProjectMetadata({
+          repoName: project.repoName,
+          repoDescription,
+          languageStats: languageStatsText,
+          givenLanguages: givenLangs.join("、"),
+          readme: insights.readme,
+          manifests: insights.manifests,
+          moduleDirs: insights.moduleDirs,
+          sourcePaths: insights.sourcePaths,
+          devTools,
+        });
+
+        if (generated) {
+          next = {
+            ...next,
+            runPlatform: generated.runPlatform || next.runPlatform,
+            runSupport: generated.runSupport || next.runSupport,
+            purpose: generated.purpose || next.purpose,
+            domain: generated.domain || next.domain,
+            mainFeatures: generated.mainFeatures || next.mainFeatures,
+            technicalFeatures: generated.technicalFeatures || next.technicalFeatures,
+            softwareDescription: generated.softwareDescription || next.softwareDescription,
+          };
+          setMeta(next);
+          setDetectStatus("");
+        } else {
+          setDetectStatus("AI 未返回可解析的元数据，请手动填写或点「AI 核对」重试");
+        }
+
+        // Tech categories from real evidence, only if not already chosen.
+        if (!next.techCategoriesGiven?.length) {
+          try {
+            const catText = await callAIForText(
+              buildTechCategoriesFromInsightsPrompt({
+                repoName: project.repoName,
+                repoDescription,
+                readme: insights.readme,
+                moduleDirs: insights.moduleDirs,
+                languageStats: languageStatsText,
+              }),
+              300
+            );
+            const cats = catText.split(/[,，]/).map((s) => s.trim()).filter((s) => GIVEN_TECH_CATEGORIES.includes(s));
+            if (cats.length) {
+              next = { ...next, techCategoriesGiven: cats };
+              setMeta(next);
+            }
+          } catch { /* keep whatever was set at creation */ }
+        }
+
+        updateProject(projectId, { meta: next });
+        setProject(getProject(projectId)!);
+      } catch (e) {
+        setDetectStatus(
+          e instanceof Error ? `自动检测失败：${e.message}` : "自动检测失败，请手动填写信息"
+        );
+      }
 
       setMetaReady(true);
     };
@@ -267,10 +365,15 @@ function ProjectDetailContent() {
     detectMeta();
   }, [project, accessToken, projectId, metaReady]);
 
-  const startGenerate = useCallback(async (opts?: { resumeManual?: boolean; freshManual?: boolean }) => {
+  const startGenerate = useCallback((opts?: { resumeManual?: boolean; freshManual?: boolean }) => {
     if (!project || !accessToken || !meta) return;
     if (!project.defaultBranch.trim()) {
       setError("项目未指定代码分支，请重新创建项目并选择分支");
+      return;
+    }
+    // A run already in flight owns the draft — never start a second writer.
+    if (isRunning(projectId)) {
+      setError("该项目的生成任务正在进行中，请等待完成。");
       return;
     }
 
@@ -282,98 +385,158 @@ function ProjectDetailContent() {
 
     setGenerating(true);
     setError("");
+    setStepIndex(-1);
+    setProgress(0);
+    setCurrentStep("准备中...");
     // Save meta before generating
     updateProject(projectId, { status: "PROCESSING", meta });
     setProject(getProject(projectId)!);
 
-    try {
+    // Snapshot everything the task needs: it must not read component state, since
+    // it keeps running after this component unmounts.
+    const token = accessToken;
+    const snapshot = {
+      repoOwner: project.repoOwner,
+      repoName: project.repoName,
+      branch: project.defaultBranch,
+      softwareName: project.softwareName,
+      version: project.version,
+      repoDescription: project.repoDescription || "",
+      meta,
+    };
+
+    startRun(projectId, async (emit): Promise<GenerationResult> => {
       // Step 0: Fetch files
-      setStepIndex(0); setCurrentStep("正在读取仓库代码..."); setProgress(5);
+      emit({ stepIndex: 0, currentStep: "正在读取仓库代码...", progress: 5 });
       const { files, languages: langExts } = await fetchRepoFiles(
-        accessToken, project.repoOwner, project.repoName, project.defaultBranch,
-        (msg, pct) => { setCurrentStep(msg); setProgress(pct); }
+        token, snapshot.repoOwner, snapshot.repoName, snapshot.branch,
+        (msg, pct) => emit({ currentStep: msg, progress: pct })
       );
 
       // Step 1: Analyze
-      setStepIndex(1); setCurrentStep("正在分析代码结构..."); setProgress(25);
+      emit({ stepIndex: 1, currentStep: "正在分析代码结构...", progress: 25 });
       const languageStr = langExts.slice(0, 10).join(", ");
       const fileTree = files.slice(0, 50).map((f) => f.path).join("\n");
       const codeSummary = files.slice(0, 10).map((f) => `// ${f.path}\n${f.content.slice(0, 500)}`).join("\n\n").slice(0, 4000);
       const totalSourceLines = files.reduce((sum, f) => sum + f.content.split("\n").length, 0);
-      setMeta((prev) => prev ? { ...prev, sourceLines: totalSourceLines } : prev);
 
-      // Persist lightweight repo snapshot for AI 核对/审核 after page refresh
+      // Persist richer repo snapshot for AI 核对/审核 after page refresh, keeping
+      // the README/moduleDirs captured during auto-detection.
+      const existingCtx = getProject(projectId)?.reviewContext;
       updateProject(projectId, {
-        reviewContext: { fileTree, languages: languageStr, codeSummary },
+        reviewContext: {
+          fileTree,
+          languages: existingCtx?.languages || languageStr,
+          codeSummary,
+          readme: existingCtx?.readme,
+          moduleDirs: existingCtx?.moduleDirs,
+        },
       });
-      setProject(getProject(projectId)!);
 
       // Step 2: AI metadata (already done in detectMeta, just confirm)
-      setStepIndex(2); setCurrentStep("正在确认元数据..."); setProgress(30);
+      emit({ stepIndex: 2, currentStep: "正在确认元数据...", progress: 30 });
 
       // Step 3: Generate code PDF (程序鉴别材料)
-      setStepIndex(3); setCurrentStep("正在生成程序鉴别材料 PDF..."); setProgress(35);
+      emit({ stepIndex: 3, currentStep: "正在生成程序鉴别材料 PDF...", progress: 35 });
       const codePDFBlob = await generateCodePDF(
-        project.softwareName, project.version, files,
-        (msg) => setCurrentStep(msg)
+        snapshot.softwareName, snapshot.version, files,
+        (msg) => emit({ currentStep: msg })
       );
 
       // Step 4: Generate manual PDF (文档鉴别材料)
-      setStepIndex(4);
-      setCurrentStep(
-        resumeManual || getManualDraft(projectId)?.markdown
-          ? "正在从断点接续生成文档鉴别材料..."
-          : "正在按章节生成文档鉴别材料..."
-      );
-      setProgress(50);
-
       const existingDraft = getManualDraft(projectId);
+      emit({
+        stepIndex: 4,
+        progress: 50,
+        currentStep: resumeManual || existingDraft?.markdown
+          ? "正在从断点接续生成文档鉴别材料..."
+          : "正在按章节生成文档鉴别材料...",
+      });
+
       const generatedMarkdown = await generateManualMarkdown(
-        project.softwareName, project.version, meta,
-        project.repoUrl, languageStr, fileTree, codeSummary,
+        snapshot.softwareName, snapshot.version, snapshot.meta,
+        snapshot.repoDescription, languageStr, fileTree, codeSummary,
         {
           projectId,
           resumeMarkdown: resumeManual || existingDraft?.markdown ? existingDraft?.markdown : undefined,
           resumeAttempt: existingDraft?.attempt,
           resumeChapterIndex: existingDraft?.nextChapterIndex,
-          onProgress: (msg) => {
-            setCurrentStep(msg);
-            const draft = getManualDraft(projectId);
-            if (draft) setManualDraft(draft);
-          },
+          onProgress: (msg) => emit({ currentStep: msg }),
         }
       );
-      setManualMarkdown(generatedMarkdown);
 
-      setCurrentStep("正在排版文档鉴别材料 PDF..."); setProgress(70);
+      emit({ currentStep: "正在排版文档鉴别材料 PDF...", progress: 70 });
       const manualPDFBlob = await generateManualPDF(
-        project.softwareName, project.version, "软件著作权人", generatedMarkdown,
-        (msg) => setCurrentStep(msg)
+        snapshot.softwareName, snapshot.version, "软件著作权人", generatedMarkdown,
+        (msg) => emit({ currentStep: msg })
       );
 
-      // Step 5: Done
-      setStepIndex(5); setCurrentStep("生成完成！"); setProgress(100);
+      // Step 5: Done — persist here so the result survives even if no page is mounted.
+      emit({ stepIndex: 5, currentStep: "生成完成！", progress: 100 });
       clearManualDraft(projectId);
-      setManualDraft(null);
       updateProject(projectId, {
         status: "DONE",
-        meta: { ...meta, sourceLines: totalSourceLines },
+        meta: { ...snapshot.meta, sourceLines: totalSourceLines },
         errorMsg: undefined,
         manualMarkdown: generatedMarkdown,
       });
-      setProject(getProject(projectId)!);
-      setCodePdfUrl(URL.createObjectURL(codePDFBlob));
-      setManualPdfUrl(URL.createObjectURL(manualPDFBlob));
-    } catch (e) {
-      const msg = e instanceof Error ? e.message : "未知错误";
-      setError(msg);
-      setManualDraft(getManualDraft(projectId));
-      updateProject(projectId, { status: "FAILED", errorMsg: msg });
-      setProject(getProject(projectId)!);
-    } finally {
-      setGenerating(false);
-    }
+
+      return {
+        markdown: generatedMarkdown,
+        codePdf: codePDFBlob,
+        manualPdf: manualPDFBlob,
+        sourceLines: totalSourceLines,
+      };
+    });
   }, [project, projectId, accessToken, meta]);
+
+  // Mirror the live run into component state: progress while running, and the
+  // final result (or error) once it settles — even if it settled while this page
+  // was unmounted.
+  useEffect(() => {
+    const sync = () => {
+      const run = getRun(projectId);
+      if (!run) return;
+
+      if (run.status === "running") {
+        setGenerating(true);
+        setStepIndex(run.progress.stepIndex);
+        setProgress(run.progress.progress);
+        setCurrentStep(run.progress.currentStep);
+        const draft = getManualDraft(projectId);
+        if (draft) setManualDraft(draft);
+        return;
+      }
+
+      const finished = takeFinishedRun(projectId);
+      if (!finished) return;
+      setGenerating(false);
+
+      if (finished.error) {
+        setError(finished.error);
+        setManualDraft(getManualDraft(projectId));
+        updateProject(projectId, { status: "FAILED", errorMsg: finished.error });
+        setProject(getProject(projectId)!);
+        return;
+      }
+
+      const result = finished.result;
+      if (!result) return;
+      setStepIndex(5);
+      setProgress(100);
+      setCurrentStep("生成完成！");
+      setManualMarkdown(result.markdown);
+      setManualDraft(null);
+      setProject(getProject(projectId)!);
+      setMeta(getProject(projectId)?.meta ?? null);
+      setCodePdfUrl(URL.createObjectURL(result.codePdf));
+      setManualPdfUrl(URL.createObjectURL(result.manualPdf));
+    };
+
+    const unsubscribe = subscribeToRun(projectId, sync);
+    sync();
+    return unsubscribe;
+  }, [projectId]);
 
   const handleDownload = (url: string | null, filename: string) => {
     if (!url) return;
@@ -382,6 +545,29 @@ function ProjectDetailContent() {
     link.download = filename;
     link.click();
   };
+
+  /**
+   * Route an action through a confirmation dialog. Used for anything that would
+   * abort a running generation or throw away generated material — a misclick on
+   * those used to silently restart or wipe a half-finished run.
+   */
+  const requestConfirm = useCallback(
+    (opts: { title: string; message: string; confirmLabel: string; destructive?: boolean; run: () => void }) => {
+      setPendingConfirm(opts);
+    },
+    []
+  );
+
+  /** Confirm-guarded generate: every entry point asks first, so a stray click can't start or restart a run. */
+  const confirmStartGenerate = useCallback(
+    (
+      opts: { resumeManual?: boolean; freshManual?: boolean } | undefined,
+      prompt: { title: string; message: string; confirmLabel: string; destructive?: boolean }
+    ) => {
+      requestConfirm({ ...prompt, run: () => startGenerate(opts) });
+    },
+    [requestConfirm, startGenerate]
+  );
 
   const handleDownloadMarkdown = () => {
     const md = manualMarkdown || project?.manualMarkdown || "";
@@ -406,7 +592,9 @@ function ProjectDetailContent() {
       version: project.version,
       completedAt: project.completedAt || "",
       branch: project.defaultBranch,
+      repoDescription: project.repoDescription || "",
     });
+    setMetaDraft({ ...project.meta });
     setForceRegenerate(false);
     setEditingProject(true);
     setError("");
@@ -425,6 +613,38 @@ function ProjectDetailContent() {
           setLoadingBranches(false);
         });
     }
+
+    // Backfill the description from GitHub when the project predates the field.
+    if (accessToken && !project.repoDescription) {
+      void (async () => {
+        try {
+          const info = await fetchRepo(accessToken, project.repoOwner, project.repoName);
+          const desc = info.description || "";
+          if (!desc) return;
+          updateProject(projectId, { repoDescription: desc });
+          setProject(getProject(projectId)!);
+          // Only fill the field if the user hasn't typed into it meanwhile.
+          setProjectDraft((prev) => (prev.repoDescription ? prev : { ...prev, repoDescription: desc }));
+        } catch { /* description is optional */ }
+      })();
+    }
+  };
+
+  /** Pull the current description from GitHub on demand (button in the edit form). */
+  const handleRefreshRepoDescription = async () => {
+    if (!project || !accessToken) return;
+    setRefreshingRepoDesc(true);
+    setError("");
+    try {
+      const info = await fetchRepo(accessToken, project.repoOwner, project.repoName);
+      const desc = info.description || "";
+      setProjectDraft((prev) => ({ ...prev, repoDescription: desc }));
+      if (!desc) setError("该仓库在 GitHub 上没有填写描述");
+    } catch (e) {
+      setError(e instanceof Error ? e.message : "获取仓库描述失败");
+    } finally {
+      setRefreshingRepoDesc(false);
+    }
   };
 
   const handleSaveProjectEdit = () => {
@@ -437,42 +657,73 @@ function ProjectDetailContent() {
       return;
     }
 
-    setSavingProject(true);
     const branchChanged = branch !== project.defaultBranch;
+    const willClear = branchChanged || forceRegenerate;
+    const hasMaterial = !!(project.manualMarkdown || manualDraft?.markdown);
+
+    // Saving with a branch change or 强制清空 discards generated material — confirm
+    // before doing it rather than silently wiping a finished document.
+    if (willClear && hasMaterial) {
+      requestConfirm({
+        title: branchChanged ? "切换分支并清空已生成材料？" : "清空已生成材料？",
+        message: branchChanged
+          ? "切换代码分支后，已生成的说明书文稿和 PDF 将被清除，无法恢复，需要重新检测并生成。"
+          : "已勾选「清空已生成的材料」。保存后说明书文稿和 PDF 将被清除，无法恢复。",
+        confirmLabel: "确认保存",
+        destructive: true,
+        run: () => applyProjectEdit({ softwareName, version, branch, branchChanged }),
+      });
+      return;
+    }
+
+    applyProjectEdit({ softwareName, version, branch, branchChanged });
+  };
+
+  const applyProjectEdit = ({
+    softwareName,
+    version,
+    branch,
+    branchChanged,
+  }: { softwareName: string; version: string; branch: string; branchChanged: boolean }) => {
+    if (!project || !meta) return;
+    setSavingProject(true);
     const nameChanged = softwareName !== project.softwareName;
     const versionChanged = version !== project.version;
+    // Metadata edited in the form takes precedence over the live copy.
+    const editedMeta: SoftwareMeta = metaDraft ? { ...metaDraft } : meta;
 
     // Branch change OR user explicitly checked "force regenerate" means the
-    // generated materials no longer apply and must be cleared.
+    // generated materials no longer apply and must be cleared. Auto-detected
+    // fields are reset so detection re-runs; user-entered descriptive fields
+    // from the edit form are preserved.
     if (branchChanged || forceRegenerate) {
       const resetMeta: SoftwareMeta = {
-        ...meta,
+        ...editedMeta,
         sourceLines: 0,
         devTools: "",
-        languagesGiven: [],
-        runPlatform: "",
-        runSupport: "",
-        purpose: "",
-        domain: "",
-        mainFeatures: "",
-        technicalFeatures: "",
+        languagesGiven: branchChanged ? [] : editedMeta.languagesGiven,
       };
+      forgetRun(projectId);
       clearManualDraft(projectId);
       setManualDraft(null);
       setManualMarkdown("");
       setCodePdfUrl(null);
       setManualPdfUrl(null);
       setMetaReady(false);
+      setMetaReview(null);
+      setManualAudit(null);
 
       updateProject(projectId, {
         softwareName,
         version,
         completedAt: projectDraft.completedAt,
         defaultBranch: branch,
+        repoDescription: projectDraft.repoDescription.trim(),
         meta: resetMeta,
         status: "PENDING",
         errorMsg: undefined,
         manualMarkdown: undefined,
+        reviewContext: branchChanged ? undefined : project.reviewContext,
       });
     } else {
       // Keep the generated document; sync renamed software name / version into it.
@@ -513,7 +764,8 @@ function ProjectDetailContent() {
         version,
         completedAt: projectDraft.completedAt,
         defaultBranch: branch,
-        meta,
+        repoDescription: projectDraft.repoDescription.trim(),
+        meta: editedMeta,
         errorMsg: undefined,
         manualMarkdown: nextManualMarkdown,
       });
@@ -527,29 +779,57 @@ function ProjectDetailContent() {
       version: updated.version,
       completedAt: updated.completedAt || "",
       branch: updated.defaultBranch,
+      repoDescription: updated.repoDescription || "",
     });
+    setMetaDraft(null);
     setError("");
     setEditingProject(false);
     setSavingProject(false);
   };
 
   const handleReviewMeta = async () => {
-    if (!project || !meta || !accessToken) return;
+    if (!project || !meta) return;
     setReviewingMeta(true);
     setMetaReviewError("");
     setMetaReview(null);
     try {
-      const ctx = project.reviewContext;
-      if (!ctx?.fileTree || !ctx?.languages) {
-        throw new Error("缺少仓库上下文，请先生成一次材料");
+      // Fetch context on demand if auto-detection never stored it (older projects,
+      // or detection failed) — 核对 should not depend on a prior generation run.
+      let ctx = project.reviewContext;
+      if (!ctx?.fileTree) {
+        if (!accessToken) throw new Error("GitHub 授权已失效，请重新登录后再核对");
+        if (!project.defaultBranch.trim()) throw new Error("项目未指定代码分支");
+        setMetaReviewError("正在补取仓库信息...");
+        const { allFilePaths } = await fetchRepoStats(
+          accessToken, project.repoOwner, project.repoName, project.defaultBranch
+        );
+        const langStats = await fetchRepoLanguages(accessToken, project.repoOwner, project.repoName);
+        const insights = await fetchRepoInsights(
+          accessToken, project.repoOwner, project.repoName, project.defaultBranch, allFilePaths
+        );
+        ctx = {
+          fileTree: insights.sourcePaths.slice(0, 60).join("\n"),
+          languages: describeLanguageStats(langStats),
+          codeSummary: insights.manifests
+            .map((m) => `--- ${m.path} ---\n${m.content.slice(0, 1200)}`)
+            .join("\n\n"),
+          readme: insights.readme.slice(0, 4000),
+          moduleDirs: insights.moduleDirs.join("\n").slice(0, 2000),
+        };
+        updateProject(projectId, { reviewContext: ctx });
+        setProject(getProject(projectId)!);
+        setMetaReviewError("");
       }
+
       const result = await reviewProjectMeta({
         softwareName: project.softwareName,
         version: project.version,
         repoName: project.repoName,
-        repoDescription: project.repoUrl,
+        repoDescription: project.repoDescription || "",
         languages: ctx.languages,
         fileTree: ctx.fileTree,
+        readme: ctx.readme || "",
+        moduleDirs: ctx.moduleDirs || "",
         meta: meta as unknown as Record<string, unknown>,
       });
       setMetaReview(result);
@@ -561,10 +841,49 @@ function ProjectDetailContent() {
     }
   };
 
+  /**
+   * Apply an AI suggestion. Array-valued fields (languages, tech categories) need
+   * splitting; scalar meta fields are assigned directly. Name/version live on the
+   * project rather than meta.
+   */
   const handleApplySuggestion = (field: string, suggestion: string) => {
     if (!meta) return;
-    const next = { ...meta, [field]: suggestion };
-    setMeta(next);
+    const value = suggestion.trim();
+    if (!value) return;
+
+    if (field === "softwareName" || field === "version") {
+      setProjectDraft((prev) => ({ ...prev, [field]: value }));
+      updateProject(projectId, { [field]: value });
+      setProject(getProject(projectId)!);
+      setAppliedIssues((prev) => ({ ...prev, [field]: true }));
+      return;
+    }
+
+    const listFields: Record<string, string[]> = {
+      languagesGiven: GIVEN_LANGUAGES,
+      techCategoriesGiven: GIVEN_TECH_CATEGORIES,
+    };
+    if (field in listFields) {
+      const allowed = listFields[field];
+      const picked = value.split(/[,，、\s]+/).map((s) => s.trim()).filter((s) => allowed.includes(s));
+      if (picked.length) setMeta({ ...meta, [field]: picked });
+      setAppliedIssues((prev) => ({ ...prev, [field]: true }));
+      return;
+    }
+
+    if (field === "sourceLines") {
+      const n = parseInt(value.replace(/[^\d]/g, ""), 10);
+      if (isFinite(n)) setMeta({ ...meta, sourceLines: n });
+      setAppliedIssues((prev) => ({ ...prev, [field]: true }));
+      return;
+    }
+
+    if (field === "category" && !SOFTWARE_CATEGORIES.includes(value)) {
+      setAppliedIssues((prev) => ({ ...prev, [field]: true }));
+      return;
+    }
+
+    setMeta({ ...meta, [field]: value });
     setAppliedIssues((prev) => ({ ...prev, [field]: true }));
   };
 
@@ -575,22 +894,41 @@ function ProjectDetailContent() {
       setAuditError("没有可审核的说明书内容");
       return;
     }
-    const ctx = project.reviewContext;
-    if (!ctx?.fileTree || !ctx?.languages || !ctx?.codeSummary) {
-      setAuditError("缺少仓库上下文，请先生成一次材料");
-      return;
-    }
     setAuditingManual(true);
     setAuditError("");
     setManualAudit(null);
     try {
+      let ctx = project.reviewContext;
+      if (!ctx?.fileTree) {
+        if (!accessToken) throw new Error("GitHub 授权已失效，请重新登录后再审核");
+        if (!project.defaultBranch.trim()) throw new Error("项目未指定代码分支");
+        const { allFilePaths } = await fetchRepoStats(
+          accessToken, project.repoOwner, project.repoName, project.defaultBranch
+        );
+        const langStats = await fetchRepoLanguages(accessToken, project.repoOwner, project.repoName);
+        const insights = await fetchRepoInsights(
+          accessToken, project.repoOwner, project.repoName, project.defaultBranch, allFilePaths
+        );
+        ctx = {
+          fileTree: insights.sourcePaths.slice(0, 60).join("\n"),
+          languages: describeLanguageStats(langStats),
+          codeSummary: insights.manifests
+            .map((m) => `--- ${m.path} ---\n${m.content.slice(0, 1200)}`)
+            .join("\n\n"),
+          readme: insights.readme.slice(0, 4000),
+          moduleDirs: insights.moduleDirs.join("\n").slice(0, 2000),
+        };
+        updateProject(projectId, { reviewContext: ctx });
+        setProject(getProject(projectId)!);
+      }
+
       const result = await auditManualMarkdown({
         softwareName: project.softwareName,
         version: project.version,
         meta: meta as unknown as Record<string, unknown>,
         languages: ctx.languages,
         fileTree: ctx.fileTree,
-        codeSummary: ctx.codeSummary,
+        codeSummary: ctx.codeSummary || ctx.readme || "",
         markdown: md,
       });
       setManualAudit(result);
@@ -642,11 +980,18 @@ function ProjectDetailContent() {
     <div className="flex flex-col min-h-screen">
       <header className="border-b border-[var(--color-border)] px-6 py-4">
         <div className="max-w-6xl mx-auto flex items-center justify-between">
+          {/* Navigation is safe during generation — the run lives outside this
+              component and keeps going, so no interception here. */}
           <Link href="/" className="flex items-center gap-2">
             <Logo />
             <span className="text-lg font-semibold">软著通</span>
           </Link>
-          <Link href="/dashboard" className="text-sm text-[var(--color-muted)] hover:text-[var(--color-foreground)] transition-colors">返回控制台</Link>
+          <Link
+            href="/dashboard"
+            className="text-sm text-[var(--color-muted)] hover:text-[var(--color-foreground)] transition-colors"
+          >
+            返回控制台
+          </Link>
         </div>
       </header>
 
@@ -679,13 +1024,22 @@ function ProjectDetailContent() {
               </div>
               <div className="flex flex-wrap gap-2">
                 <button
-                  onClick={() => startGenerate({ resumeManual: true })}
+                  onClick={() => confirmStartGenerate({ resumeManual: true }, {
+                    title: "从断点继续生成？",
+                    message: "将从已保存的草稿继续生成说明书。生成过程中请不要刷新或关闭页面。",
+                    confirmLabel: "继续生成",
+                  })}
                   className="px-4 py-2 text-sm bg-[var(--color-primary)] hover:bg-[var(--color-primary-hover)] text-white rounded-lg transition-colors"
                 >
                   从断点继续
                 </button>
                 <button
-                  onClick={() => startGenerate({ freshManual: true })}
+                  onClick={() => confirmStartGenerate({ freshManual: true }, {
+                    title: "放弃草稿并重新开始？",
+                    message: `已保存的 ${manualDraft?.lines || 0} 行草稿将被删除，无法恢复，整份说明书需要重新生成。`,
+                    confirmLabel: "放弃草稿，重新开始",
+                    destructive: true,
+                  })}
                   className="px-4 py-2 text-sm border border-[var(--color-border)] rounded-lg text-[var(--color-muted)] hover:text-[var(--color-foreground)] hover:border-[var(--color-muted)] transition-colors"
                 >
                   放弃草稿，重新开始
@@ -782,6 +1136,171 @@ function ProjectDetailContent() {
                   </p>
                 ) : null}
 
+                <div>
+                  <div className="flex items-center justify-between mb-1">
+                    <label className="block text-xs text-[var(--color-muted)]">仓库描述（用于 AI 分析项目用途）</label>
+                    <button
+                      type="button"
+                      onClick={handleRefreshRepoDescription}
+                      disabled={refreshingRepoDesc || !accessToken}
+                      className="text-xs text-[var(--color-primary)] hover:underline disabled:opacity-50"
+                    >
+                      {refreshingRepoDesc ? "获取中..." : "从 GitHub 获取"}
+                    </button>
+                  </div>
+                  <textarea
+                    value={projectDraft.repoDescription}
+                    onChange={(e) => setProjectDraft((prev) => ({ ...prev, repoDescription: e.target.value }))}
+                    rows={2}
+                    placeholder="GitHub 仓库描述，留空则 AI 只依据 README 和目录结构判断"
+                    className="w-full px-3 py-2 bg-[var(--color-input-bg)] border border-[var(--color-border)] rounded-lg text-sm focus:outline-none focus:border-[var(--color-primary)] resize-none"
+                  />
+                </div>
+
+                {/* Full registration metadata — everything filled at creation time
+                    is editable here so mistakes can be corrected without recreating. */}
+                {metaDraft && (
+                  <div className="border-t border-[var(--color-border)] pt-4 space-y-4">
+                    <h3 className="text-sm font-medium">登记信息（创建时填写，可修改）</h3>
+
+                    <div className="grid grid-cols-2 gap-4">
+                      <div>
+                        <label className="block text-xs text-[var(--color-muted)] mb-1">软件分类</label>
+                        <select
+                          value={metaDraft.category}
+                          onChange={(e) => setMetaDraft({ ...metaDraft, category: e.target.value })}
+                          className="w-full px-3 py-2 bg-[var(--color-input-bg)] border border-[var(--color-border)] rounded-lg text-sm focus:outline-none focus:border-[var(--color-primary)]"
+                        >
+                          {SOFTWARE_CATEGORIES.map((c) => <option key={c} value={c}>{c}</option>)}
+                        </select>
+                      </div>
+                      <div>
+                        <label className="block text-xs text-[var(--color-muted)] mb-1">源程序行数</label>
+                        <input
+                          type="number"
+                          value={metaDraft.sourceLines || 0}
+                          onChange={(e) => setMetaDraft({ ...metaDraft, sourceLines: parseInt(e.target.value, 10) || 0 })}
+                          className="w-full px-3 py-2 bg-[var(--color-input-bg)] border border-[var(--color-border)] rounded-lg text-sm focus:outline-none focus:border-[var(--color-primary)]"
+                        />
+                      </div>
+                    </div>
+
+                    <div>
+                      <label className="block text-xs text-[var(--color-muted)] mb-2">编程语言（给定项）</label>
+                      <div className="flex flex-wrap gap-2">
+                        {GIVEN_LANGUAGES.map((lang) => {
+                          const on = metaDraft.languagesGiven.includes(lang);
+                          return (
+                            <button
+                              key={lang}
+                              type="button"
+                              onClick={() => setMetaDraft({
+                                ...metaDraft,
+                                languagesGiven: on
+                                  ? metaDraft.languagesGiven.filter((l) => l !== lang)
+                                  : [...metaDraft.languagesGiven, lang],
+                              })}
+                              className={`px-2.5 py-1 text-xs rounded-lg border transition-colors ${on ? "bg-[var(--color-primary)] text-white border-[var(--color-primary)]" : "border-[var(--color-border)] text-[var(--color-muted)] hover:border-[var(--color-muted)]"}`}
+                            >
+                              {lang}
+                            </button>
+                          );
+                        })}
+                      </div>
+                      <input
+                        type="text"
+                        placeholder="补充语言（逗号分隔）"
+                        value={metaDraft.languagesExtra.join(", ")}
+                        onChange={(e) => setMetaDraft({ ...metaDraft, languagesExtra: e.target.value.split(",").map((s) => s.trim()).filter(Boolean) })}
+                        className="w-full mt-2 px-3 py-2 bg-[var(--color-input-bg)] border border-[var(--color-border)] rounded-lg text-sm focus:outline-none focus:border-[var(--color-primary)]"
+                      />
+                    </div>
+
+                    <div>
+                      <label className="block text-xs text-[var(--color-muted)] mb-2">技术特点分类</label>
+                      <div className="flex flex-wrap gap-2">
+                        {GIVEN_TECH_CATEGORIES.map((cat) => {
+                          const on = metaDraft.techCategoriesGiven.includes(cat);
+                          return (
+                            <button
+                              key={cat}
+                              type="button"
+                              onClick={() => setMetaDraft({
+                                ...metaDraft,
+                                techCategoriesGiven: on
+                                  ? metaDraft.techCategoriesGiven.filter((c) => c !== cat)
+                                  : [...metaDraft.techCategoriesGiven, cat],
+                              })}
+                              className={`px-2.5 py-1 text-xs rounded-lg border transition-colors ${on ? "bg-[var(--color-primary)] text-white border-[var(--color-primary)]" : "border-[var(--color-border)] text-[var(--color-muted)] hover:border-[var(--color-muted)]"}`}
+                            >
+                              {cat}
+                            </button>
+                          );
+                        })}
+                      </div>
+                      <input
+                        type="text"
+                        placeholder="补充分类（逗号分隔）"
+                        value={metaDraft.techCategoriesExtra.join(", ")}
+                        onChange={(e) => setMetaDraft({ ...metaDraft, techCategoriesExtra: e.target.value.split(",").map((s) => s.trim()).filter(Boolean) })}
+                        className="w-full mt-2 px-3 py-2 bg-[var(--color-input-bg)] border border-[var(--color-border)] rounded-lg text-sm focus:outline-none focus:border-[var(--color-primary)]"
+                      />
+                    </div>
+
+                    <div className="grid grid-cols-2 gap-4">
+                      <DraftInput label="开发硬件环境" value={metaDraft.devHardware} onChange={(v) => setMetaDraft({ ...metaDraft, devHardware: v })} />
+                      <DraftInput label="运行硬件环境" value={metaDraft.runHardware} onChange={(v) => setMetaDraft({ ...metaDraft, runHardware: v })} />
+                      <DraftInput label="开发操作系统" value={metaDraft.devOS} onChange={(v) => setMetaDraft({ ...metaDraft, devOS: v })} />
+                      <DraftInput label="开发工具" value={metaDraft.devTools} onChange={(v) => setMetaDraft({ ...metaDraft, devTools: v })} />
+                      <DraftInput label="运行平台" value={metaDraft.runPlatform} onChange={(v) => setMetaDraft({ ...metaDraft, runPlatform: v })} />
+                      <DraftInput label="运行支撑环境" value={metaDraft.runSupport} onChange={(v) => setMetaDraft({ ...metaDraft, runSupport: v })} />
+                      <DraftInput label="面向领域/行业" value={metaDraft.domain} onChange={(v) => setMetaDraft({ ...metaDraft, domain: v })} />
+                      <div>
+                        <label className="block text-xs text-[var(--color-muted)] mb-1">发表状态</label>
+                        <select
+                          value={metaDraft.publishStatus}
+                          onChange={(e) => setMetaDraft({ ...metaDraft, publishStatus: e.target.value })}
+                          className="w-full px-3 py-2 bg-[var(--color-input-bg)] border border-[var(--color-border)] rounded-lg text-sm focus:outline-none focus:border-[var(--color-primary)]"
+                        >
+                          <option value="未发表">未发表</option>
+                          <option value="已发表">已发表</option>
+                        </select>
+                      </div>
+                      <div>
+                        <label className="block text-xs text-[var(--color-muted)] mb-1">原创/修改</label>
+                        <select
+                          value={metaDraft.originalType}
+                          onChange={(e) => setMetaDraft({ ...metaDraft, originalType: e.target.value })}
+                          className="w-full px-3 py-2 bg-[var(--color-input-bg)] border border-[var(--color-border)] rounded-lg text-sm focus:outline-none focus:border-[var(--color-primary)]"
+                        >
+                          <option value="原创">原创</option>
+                          <option value="修改">修改</option>
+                          <option value="翻译">翻译</option>
+                          <option value="合成">合成</option>
+                        </select>
+                      </div>
+                      <div>
+                        <label className="block text-xs text-[var(--color-muted)] mb-1">开发方式</label>
+                        <select
+                          value={metaDraft.devMethod}
+                          onChange={(e) => setMetaDraft({ ...metaDraft, devMethod: e.target.value })}
+                          className="w-full px-3 py-2 bg-[var(--color-input-bg)] border border-[var(--color-border)] rounded-lg text-sm focus:outline-none focus:border-[var(--color-primary)]"
+                        >
+                          <option value="单独开发">单独开发</option>
+                          <option value="合作开发">合作开发</option>
+                          <option value="委托开发">委托开发</option>
+                          <option value="下达任务开发">下达任务开发</option>
+                        </select>
+                      </div>
+                    </div>
+
+                    <DraftTextarea label="开发目的" value={metaDraft.purpose} onChange={(v) => setMetaDraft({ ...metaDraft, purpose: v })} />
+                    <DraftTextarea label="主要功能" value={metaDraft.mainFeatures} onChange={(v) => setMetaDraft({ ...metaDraft, mainFeatures: v })} rows={3} />
+                    <DraftTextarea label="技术特点" value={metaDraft.technicalFeatures} onChange={(v) => setMetaDraft({ ...metaDraft, technicalFeatures: v })} />
+                    <DraftTextarea label="软件说明" value={metaDraft.softwareDescription} onChange={(v) => setMetaDraft({ ...metaDraft, softwareDescription: v })} />
+                  </div>
+                )}
+
                 {projectDraft.branch.trim() === project.defaultBranch && (project.manualMarkdown || manualMarkdown) && (
                   <label className="flex items-start gap-2 text-xs cursor-pointer">
                     <input
@@ -805,7 +1324,7 @@ function ProjectDetailContent() {
                     {savingProject ? "保存中..." : "保存项目"}
                   </button>
                   <button
-                    onClick={() => { setEditingProject(false); setError(""); }}
+                    onClick={() => { setEditingProject(false); setMetaDraft(null); setError(""); }}
                     className="px-4 py-2 text-sm border border-[var(--color-border)] rounded-lg text-[var(--color-muted)] hover:text-[var(--color-foreground)] hover:border-[var(--color-muted)] transition-colors"
                   >
                     取消
@@ -824,9 +1343,9 @@ function ProjectDetailContent() {
                 <h2 className="text-base font-semibold">软件信息（自动生成，可编辑）</h2>
                 <button
                   onClick={handleReviewMeta}
-                  disabled={reviewingMeta || !metaReady || !project.reviewContext}
+                  disabled={reviewingMeta || generating}
                   className="px-3 py-1.5 text-xs border border-[var(--color-border)] rounded-lg hover:border-[var(--color-primary)] transition-colors disabled:opacity-50 flex items-center gap-1.5"
-                  title={!project.reviewContext ? "请先生成一次材料后再核对" : "AI 核对当前填写是否合理"}
+                  title="AI 核对当前填写是否合理"
                 >
                   {reviewingMeta ? (
                     <>
@@ -843,7 +1362,10 @@ function ProjectDetailContent() {
                   )}
                 </button>
               </div>
-              {!metaReady && <p className="text-xs text-[var(--color-primary)] mb-4">正在自动检测和生成元数据...</p>}
+              {!metaReady && <p className="text-xs text-[var(--color-primary)] mb-4">{detectStatus || "正在自动检测和生成元数据..."}</p>}
+              {metaReady && detectStatus && (
+                <p className="text-xs text-[var(--color-error)] mb-4">{detectStatus}</p>
+              )}
 
               {metaReviewError && (
                 <div className="mb-4 bg-[var(--color-error)]/10 border border-[var(--color-error)]/20 rounded-lg p-3 text-xs text-[var(--color-error)]">
@@ -935,7 +1457,13 @@ function ProjectDetailContent() {
               </div>
             </div>
 
-            <button onClick={() => startGenerate()} disabled={!metaReady}
+            <button
+              onClick={() => confirmStartGenerate(undefined, {
+                title: "开始生成材料？",
+                message: "生成过程会调用 AI 逐章撰写说明书，可能需要数分钟。期间请勿刷新或关闭页面。",
+                confirmLabel: "开始生成",
+              })}
+              disabled={!metaReady || generating}
               className="w-full py-3 bg-[var(--color-primary)] hover:bg-[var(--color-primary-hover)] text-white rounded-lg font-medium transition-colors disabled:opacity-50 disabled:cursor-not-allowed">
               {metaReady ? "确认信息并开始生成" : "正在检测元数据..."}
             </button>
@@ -963,6 +1491,11 @@ function ProjectDetailContent() {
                   说明书草稿已缓存：{manualDraft.lines} 行文档（中断后可从断点继续，不必整份重写）
                 </p>
               ) : null}
+              {generating && (
+                <p className="text-xs text-[var(--color-primary)] mt-2">
+                  正在生成中，请勿刷新或关闭页面（关闭页面会中断任务）。可以切换到其他页面，任务会在后台继续，返回本页可继续查看进度。
+                </p>
+              )}
             </div>
             <div className="space-y-3">
               {steps.map((step, i) => {
@@ -1054,7 +1587,7 @@ function ProjectDetailContent() {
                   )}
                   <button
                     onClick={handleReexportManualPDF}
-                    disabled={reexporting || !(manualMarkdown || project.manualMarkdown)}
+                    disabled={reexporting || generating || !(manualMarkdown || project.manualMarkdown)}
                     className="px-3 py-1.5 text-xs bg-[var(--color-primary)] hover:bg-[var(--color-primary-hover)] text-white rounded-lg transition-colors disabled:opacity-50"
                   >
                     {reexporting ? "导出中..." : "重新导出 PDF"}
@@ -1091,9 +1624,9 @@ function ProjectDetailContent() {
                 </div>
                 <button
                   onClick={handleAuditManual}
-                  disabled={auditingManual || !project.reviewContext}
+                  disabled={auditingManual || generating}
                   className="px-3 py-1.5 text-xs border border-[var(--color-border)] rounded-lg hover:border-[var(--color-primary)] transition-colors disabled:opacity-50 flex items-center gap-1.5"
-                  title={!project.reviewContext ? "请先生成一次材料后再审核" : "AI 审核当前说明书质量"}
+                  title="AI 审核当前说明书质量"
                 >
                   {auditingManual ? (
                     <>
@@ -1202,8 +1735,27 @@ function ProjectDetailContent() {
               )}
             </div>
 
-            <button onClick={() => { clearManualDraft(projectId); setManualDraft(null); updateProject(projectId, { status: "PENDING" }); setProject(getProject(projectId)!); setMetaReady(false); setCodePdfUrl(null); setManualPdfUrl(null); setManualMarkdown(""); }}
-                className="px-6 py-3 border border-[var(--color-border)] rounded-lg text-sm text-[var(--color-muted)] hover:text-[var(--color-foreground)] hover:border-[var(--color-muted)] transition-colors">重新生成</button>
+            <button
+              onClick={() => requestConfirm({
+                title: "清空并重新生成？",
+                message: "已生成的说明书文稿和 PDF 将被清除，无法恢复。项目会回到待生成状态，需要重新走一遍完整生成流程。",
+                confirmLabel: "清空并重新生成",
+                destructive: true,
+                run: () => {
+                  forgetRun(projectId);
+                  clearManualDraft(projectId);
+                  setManualDraft(null);
+                  updateProject(projectId, { status: "PENDING" });
+                  setProject(getProject(projectId)!);
+                  setMetaReady(false);
+                  setCodePdfUrl(null);
+                  setManualPdfUrl(null);
+                  setManualMarkdown("");
+                  setManualAudit(null);
+                  setMetaReview(null);
+                },
+              })}
+              className="px-6 py-3 border border-[var(--color-border)] rounded-lg text-sm text-[var(--color-muted)] hover:text-[var(--color-foreground)] hover:border-[var(--color-muted)] transition-colors">重新生成</button>
 
             {/* Registration form reference */}
             <div className="bg-[var(--color-card)] border border-[var(--color-border)] rounded-xl p-6">
@@ -1284,14 +1836,32 @@ function ProjectDetailContent() {
             <div className="flex flex-wrap gap-3">
               {manualDraft?.markdown ? (
                 <button
-                  onClick={() => startGenerate({ resumeManual: true })}
+                  onClick={() => confirmStartGenerate({ resumeManual: true }, {
+                    title: "从断点继续生成？",
+                    message: "将从已保存的草稿继续生成说明书。生成过程中请不要刷新或关闭页面。",
+                    confirmLabel: "继续生成",
+                  })}
                   className="px-6 py-3 bg-[var(--color-primary)] hover:bg-[var(--color-primary-hover)] text-white rounded-lg font-medium transition-colors"
                 >
                   从断点继续生成说明书
                 </button>
               ) : null}
               <button
-                onClick={() => startGenerate(manualDraft?.markdown ? { freshManual: true } : undefined)}
+                onClick={() => confirmStartGenerate(
+                  manualDraft?.markdown ? { freshManual: true } : undefined,
+                  manualDraft?.markdown
+                    ? {
+                        title: "放弃草稿并重新开始？",
+                        message: `已保存的 ${manualDraft.lines || 0} 行草稿将被删除，无法恢复，整份说明书需要重新生成。`,
+                        confirmLabel: "放弃草稿，重新开始",
+                        destructive: true,
+                      }
+                    : {
+                        title: "重新生成材料？",
+                        message: "生成过程会调用 AI 逐章撰写说明书，可能需要数分钟。期间请勿刷新或关闭页面。",
+                        confirmLabel: "开始生成",
+                      }
+                )}
                 className="px-6 py-3 border border-[var(--color-border)] hover:border-[var(--color-primary)] rounded-lg font-medium transition-colors"
               >
                 {manualDraft?.markdown ? "放弃草稿，重新开始" : "重新生成"}
@@ -1303,6 +1873,21 @@ function ProjectDetailContent() {
           </div>
         )}
       </main>
+
+      {pendingConfirm && (
+        <ConfirmDialog
+          title={pendingConfirm.title}
+          message={pendingConfirm.message}
+          confirmLabel={pendingConfirm.confirmLabel}
+          destructive={pendingConfirm.destructive}
+          onConfirm={() => {
+            const run = pendingConfirm.run;
+            setPendingConfirm(null);
+            run();
+          }}
+          onCancel={() => setPendingConfirm(null)}
+        />
+      )}
     </div>
   );
 }
@@ -1312,6 +1897,34 @@ function MetaField({ label, value }: { label: string; value: string }) {
     <div>
       <div className="text-xs text-[var(--color-muted)] mb-1">{label}</div>
       <div className="text-sm">{value || <span className="text-[var(--color-muted)]">-</span>}</div>
+    </div>
+  );
+}
+
+function DraftInput({ label, value, onChange }: { label: string; value: string; onChange: (v: string) => void }) {
+  return (
+    <div>
+      <label className="block text-xs text-[var(--color-muted)] mb-1">{label}</label>
+      <input
+        type="text"
+        value={value}
+        onChange={(e) => onChange(e.target.value)}
+        className="w-full px-3 py-2 bg-[var(--color-input-bg)] border border-[var(--color-border)] rounded-lg text-sm focus:outline-none focus:border-[var(--color-primary)]"
+      />
+    </div>
+  );
+}
+
+function DraftTextarea({ label, value, onChange, rows = 2 }: { label: string; value: string; onChange: (v: string) => void; rows?: number }) {
+  return (
+    <div>
+      <label className="block text-xs text-[var(--color-muted)] mb-1">{label}</label>
+      <textarea
+        value={value}
+        onChange={(e) => onChange(e.target.value)}
+        rows={rows}
+        className="w-full px-3 py-2 bg-[var(--color-input-bg)] border border-[var(--color-border)] rounded-lg text-sm focus:outline-none focus:border-[var(--color-primary)] resize-none"
+      />
     </div>
   );
 }

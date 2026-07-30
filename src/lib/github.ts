@@ -120,6 +120,15 @@ export async function fetchRepoBranches(token: string, owner: string, repo: stri
   return res.json();
 }
 
+/** Single-repo metadata — used to backfill the description for older projects. */
+export async function fetchRepo(token: string, owner: string, repo: string): Promise<GitHubRepo> {
+  const res = await fetch(`https://api.github.com/repos/${owner}/${repo}`, {
+    headers: { Authorization: `Bearer ${token}` },
+  });
+  if (!res.ok) throw new Error("获取仓库信息失败");
+  return res.json();
+}
+
 async function fetchTree(
   token: string, owner: string, repo: string, branch: string
 ): Promise<GitHubFile[]> {
@@ -257,6 +266,106 @@ export async function fetchRepoFiles(
   }
 
   return { files, allFilePaths, languages, extRatios, totalTreeSize: fullTree.length };
+}
+
+// ── Accurate language detection via GitHub Linguist ──
+
+/**
+ * GitHub's own language stats (byte counts per language). Far more accurate than
+ * counting file extensions: Linguist ignores vendored/generated files and weighs
+ * by actual code volume, so a repo with 200 tiny config files won't drown out the
+ * real implementation language.
+ */
+export async function fetchRepoLanguages(
+  token: string,
+  owner: string,
+  repo: string
+): Promise<{ name: string; bytes: number; ratio: number }[]> {
+  const res = await fetch(`https://api.github.com/repos/${owner}/${repo}/languages`, {
+    headers: { Authorization: `Bearer ${token}` },
+  });
+  if (!res.ok) return [];
+  const data = (await res.json()) as Record<string, number>;
+  const total = Object.values(data).reduce((a, b) => a + b, 0);
+  if (!total) return [];
+  return Object.entries(data)
+    .map(([name, bytes]) => ({ name, bytes, ratio: bytes / total }))
+    .sort((a, b) => b.bytes - a.bytes);
+}
+
+/** Files whose contents best describe what a project actually does. */
+const INSIGHT_FILES = [
+  "README.md", "README", "README.txt", "README.rst", "readme.md",
+  "package.json", "pyproject.toml", "requirements.txt", "Cargo.toml",
+  "go.mod", "pom.xml", "build.gradle", "composer.json", "Gemfile",
+  "docker-compose.yml", "Dockerfile",
+];
+
+export interface RepoInsights {
+  /** README text (truncated) — richest source of purpose/features */
+  readme: string;
+  /** Dependency manifests, keyed by filename */
+  manifests: { path: string; content: string }[];
+  /** Directory names at depth 1–2, describing module layout */
+  moduleDirs: string[];
+  /** Representative source file paths */
+  sourcePaths: string[];
+}
+
+/**
+ * Gather the human-meaningful context for metadata generation: README, dependency
+ * manifests, and module layout. The previous implementation passed only 50 raw file
+ * paths and an empty code summary, which is why 开发目的/主要功能 came out vague.
+ */
+export async function fetchRepoInsights(
+  token: string,
+  owner: string,
+  repo: string,
+  branch: string,
+  allFilePaths: string[]
+): Promise<RepoInsights> {
+  const pathSet = new Map(allFilePaths.map((p) => [p.toLowerCase(), p]));
+
+  // README lives at repo root; try the common spellings.
+  let readme = "";
+  for (const cand of ["readme.md", "readme", "readme.txt", "readme.rst"]) {
+    const actual = pathSet.get(cand);
+    if (actual) {
+      readme = await fetchContent(token, owner, repo, actual);
+      if (readme) break;
+    }
+  }
+  // README.md is in IGNORED_FILES so it may be absent from allFilePaths — fetch directly.
+  if (!readme) {
+    readme = await fetchContent(token, owner, repo, "README.md");
+  }
+
+  const manifests: { path: string; content: string }[] = [];
+  for (const name of INSIGHT_FILES) {
+    if (/^readme/i.test(name)) continue;
+    const actual = pathSet.get(name.toLowerCase()) || (name === "package.json" ? name : null);
+    if (!actual) continue;
+    const content = await fetchContent(token, owner, repo, actual);
+    if (content) manifests.push({ path: actual, content: content.slice(0, 3000) });
+    if (manifests.length >= 4) break;
+  }
+
+  // Module layout: directory names at depth 1 and 2 hint at feature boundaries.
+  const dirs = new Set<string>();
+  for (const p of allFilePaths) {
+    const parts = p.split("/");
+    if (parts.length > 1) dirs.add(parts.slice(0, 1).join("/"));
+    if (parts.length > 2) dirs.add(parts.slice(0, 2).join("/"));
+  }
+  const moduleDirs = Array.from(dirs).sort().slice(0, 60);
+
+  // Prefer files that look like entry points / feature modules over deep utilities.
+  const sourcePaths = allFilePaths
+    .filter((p) => !NON_CODE_EXT.has(getExt(p)))
+    .sort((a, b) => a.split("/").length - b.split("/").length)
+    .slice(0, 80);
+
+  return { readme: readme.slice(0, 6000), manifests, moduleDirs, sourcePaths };
 }
 
 // ── Lightweight stats: fetch tree only, no content ──

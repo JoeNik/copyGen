@@ -9,6 +9,7 @@ import { SessionProvider } from "next-auth/react";
 import { useRouter } from "next/navigation";
 import { useEffect, useState, useMemo } from "react";
 import { getProjects, getAIKey, getActiveProvider, deleteProject, deleteProjects, type Project } from "@/lib/storage";
+import { APP_VERSION } from "@/lib/version";
 import AISettingsModal from "@/components/AISettingsModal";
 
 const statusConfig: Record<string, { label: string; color: string }> = {
@@ -121,6 +122,7 @@ function DashboardContent() {
           <Link href="/" className="flex items-center gap-2">
             <Logo />
             <span className="text-lg font-semibold">软著通</span>
+            <span className="text-xs text-[var(--color-muted)]">v{APP_VERSION}</span>
           </Link>
           <div className="flex items-center gap-4">
             <button

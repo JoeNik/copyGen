@@ -1,12 +1,14 @@
 {
   "name": "ruanzhu-tong",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "private": true,
   "scripts": {
     "dev": "next dev",
     "build": "next build",
     "start": "next start",
-    "lint": "eslint"
+    "lint": "eslint",
+    "bump:patch": "node scripts/bump-version.cjs",
+    "hooks:install": "git config core.hooksPath .githooks"
   },
   "dependencies": {
     "@libsql/client": "^0.17.4",

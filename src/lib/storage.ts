@@ -545,6 +545,12 @@ export interface Project {
   repoOwner: string;
   repoName: string;
   repoUrl: string;
+  /**
+   * GitHub repo description. Distinct from `repoUrl` — AI prompts need the prose
+   * description, not the link. Optional because projects created before this
+   * field existed don't have it; the detail page backfills it from the API.
+   */
+  repoDescription?: string;
   defaultBranch: string;
   softwareName: string;
   version: string;
@@ -557,13 +563,18 @@ export interface Project {
   manualMarkdown?: string;
   /**
    * Lightweight repo snapshot used by AI 核对/审核 so those features work after a
-   * page refresh without re-downloading the repo. fileTree = first paths joined by
-   * newlines; codeSummary = truncated head-of-file excerpts (filled at generate time).
+   * page refresh without re-downloading the repo. Populated during metadata
+   * auto-detection (so 核对 works before the first full generation) and refreshed
+   * with richer code excerpts when materials are generated.
    */
   reviewContext?: {
     fileTree: string;
     languages: string;
     codeSummary: string;
+    /** README excerpt — the strongest signal for purpose/feature review */
+    readme?: string;
+    /** Module directory layout */
+    moduleDirs?: string;
   };
 }
 
