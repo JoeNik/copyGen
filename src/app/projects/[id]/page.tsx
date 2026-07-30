@@ -966,6 +966,13 @@ function ProjectDetailContent() {
       return;
     }
 
+    // Every remaining known key is a string field; an array-typed one would
+    // break the UI's .join()/.includes() calls, so refuse rather than corrupt it.
+    if (Array.isArray((meta as unknown as Record<string, unknown>)[field])) {
+      setMetaReviewError(`「${META_FIELD_LABELS_UI[field] || field}」需要选择项而非文本，未应用。请在「编辑项目」中手动勾选。`);
+      return;
+    }
+
     setMeta({ ...meta, [field]: value });
     markApplied();
   };

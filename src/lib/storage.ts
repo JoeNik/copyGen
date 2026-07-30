@@ -544,6 +544,61 @@ export function createEmptyMeta(): SoftwareMeta {
   };
 }
 
+function toStringArray(value: unknown): string[] {
+  if (Array.isArray(value)) return value.map((v) => String(v)).filter(Boolean);
+  // A string can land here from an older build that assigned an AI suggestion
+  // straight into an array field; split it back rather than crashing on .join().
+  if (typeof value === "string") {
+    return value.split(/[,，、;；]+/).map((s) => s.trim()).filter(Boolean);
+  }
+  return [];
+}
+
+function toText(value: unknown): string {
+  if (typeof value === "string") return value;
+  if (typeof value === "number" || typeof value === "boolean") return String(value);
+  if (Array.isArray(value)) return value.map((v) => String(v)).join("；");
+  return "";
+}
+
+/**
+ * Coerce persisted metadata into the shape the UI expects.
+ *
+ * Project metadata is stored as free-form JSON in localStorage and has been
+ * written by several app versions, so a field's type is not guaranteed. Any
+ * mismatch used to surface as a render crash (`.join is not a function`) that
+ * took down the whole page, so normalise on read instead of trusting the store.
+ */
+export function normalizeMeta(raw: unknown): SoftwareMeta {
+  const base = createEmptyMeta();
+  if (!raw || typeof raw !== "object") return base;
+  const m = raw as Record<string, unknown>;
+  const lines = Number(m.sourceLines);
+
+  return {
+    devHardware: toText(m.devHardware),
+    runHardware: toText(m.runHardware),
+    devOS: toText(m.devOS),
+    devTools: toText(m.devTools),
+    runPlatform: toText(m.runPlatform),
+    runSupport: toText(m.runSupport),
+    category: toText(m.category) || base.category,
+    sourceLines: Number.isFinite(lines) && lines >= 0 ? Math.round(lines) : 0,
+    purpose: toText(m.purpose),
+    domain: toText(m.domain),
+    mainFeatures: toText(m.mainFeatures),
+    technicalFeatures: toText(m.technicalFeatures),
+    languagesGiven: toStringArray(m.languagesGiven),
+    languagesExtra: toStringArray(m.languagesExtra),
+    techCategoriesGiven: toStringArray(m.techCategoriesGiven),
+    techCategoriesExtra: toStringArray(m.techCategoriesExtra),
+    softwareDescription: toText(m.softwareDescription),
+    originalType: toText(m.originalType) || base.originalType,
+    devMethod: toText(m.devMethod) || base.devMethod,
+    publishStatus: toText(m.publishStatus) || base.publishStatus,
+  };
+}
+
 // ── Project data ──
 
 export interface Project {
@@ -609,13 +664,44 @@ function writeStorage(key: string, value: string) {
   }
 }
 
+/** Coerce a persisted project record into the expected shape. */
+function normalizeProject(raw: unknown): Project | null {
+  if (!raw || typeof raw !== "object") return null;
+  const p = raw as Record<string, unknown>;
+  if (typeof p.id !== "string" || !p.id) return null;
+
+  const status = p.status;
+  const validStatus =
+    status === "PENDING" || status === "PROCESSING" || status === "DONE" || status === "FAILED"
+      ? status
+      : "PENDING";
+
+  return {
+    ...(p as unknown as Project),
+    id: p.id,
+    repoOwner: typeof p.repoOwner === "string" ? p.repoOwner : "",
+    repoName: typeof p.repoName === "string" ? p.repoName : "",
+    repoUrl: typeof p.repoUrl === "string" ? p.repoUrl : "",
+    repoDescription: typeof p.repoDescription === "string" ? p.repoDescription : undefined,
+    defaultBranch: typeof p.defaultBranch === "string" ? p.defaultBranch : "",
+    softwareName: typeof p.softwareName === "string" ? p.softwareName : "",
+    version: typeof p.version === "string" ? p.version : "",
+    status: validStatus,
+    // The UI calls array methods on meta fields directly, so this must be sound.
+    meta: normalizeMeta(p.meta),
+    createdAt: typeof p.createdAt === "string" ? p.createdAt : new Date().toISOString(),
+    manualMarkdown: typeof p.manualMarkdown === "string" ? p.manualMarkdown : undefined,
+  };
+}
+
 export function getProjects(): Project[] {
   if (typeof window === "undefined") return [];
   const raw = localStorage.getItem(STORAGE_KEYS.PROJECTS);
   if (!raw) return [];
   try {
     const parsed = JSON.parse(raw);
-    return Array.isArray(parsed) ? parsed : [];
+    if (!Array.isArray(parsed)) return [];
+    return parsed.map(normalizeProject).filter((p): p is Project => p !== null);
   } catch {
     return [];
   }
