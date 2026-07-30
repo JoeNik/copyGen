@@ -421,15 +421,21 @@ export interface MetaReviewIssue {
   field: string;
   /** 中文字段名，便于展示 */
   fieldLabel: string;
+  /** 问题类型：区分“漏了内容”和“写错了” */
+  kind: "错误" | "遗漏" | "不一致" | "规范";
   severity: "high" | "medium" | "low";
   /** 现值有什么问题 */
   problem: string;
-  /** 建议改成什么 */
+  /** 建议改成什么 — 完整的可替换文本 */
   suggestion: string;
 }
 
 export interface MetaReviewResult {
   issues: MetaReviewIssue[];
+  /** AI 从 README/目录结构中识别出的项目实际能力 */
+  detectedCapabilities: string[];
+  /** 上述能力中未被「主要功能」覆盖的部分 */
+  missingFromMainFeatures: string[];
   overallComment: string;
 }
 
@@ -469,41 +475,54 @@ export function buildMetaReviewPrompt(input: {
   moduleDirs?: string;
   meta: Record<string, unknown>;
 }): string {
-  return `你是中国计算机软件著作权登记材料的审核专家。下面是一个软件项目的登记信息，请逐项核对是否存在填写错误、前后矛盾、与仓库实际情况不符、或不符合软著登记规范的地方。
+  return `你是中国计算机软件著作权登记材料的审核专家。下面是一个软件项目的登记信息，请逐项核对是否存在填写错误、遗漏、前后矛盾、与仓库实际情况不符、或不符合软著登记规范的地方。
 
-判断依据：
+核对要求：
 - 只依据下方提供的 README、语言统计、目录结构等客观事实，不要凭空想象仓库里没有的东西。
 - 软件全称应以“软件”“系统”“平台”等结尾，不含版本号；版本号形如 V1.0。
 - 运行平台/运行支撑环境/编程语言应与语言统计、依赖清单一致（例如 Node/前端项目不应写成仅 Windows 桌面 exe）。这几项不一致是形式审查能发现的硬问题，优先级最高。
-- 开发目的、主要功能、技术特点应彼此一致，且与 README、目录结构不矛盾。
-- 软著登记材料本身使用概括性的常规表述，这是正常的：只要功能项对应本项目确实具备的能力，就不要因为“不够详细”而报问题。仅当功能项明显与本项目无关（写了本项目根本没有的能力），或通篇与仓库实际情况脱节时，才提出问题。
-- 若某字段看起来合理、无需修改，就不要为它编造问题。
+- 开发目的、主要功能、技术特点、软件说明应彼此一致，且与 README、目录结构不矛盾。
+
+【必须逐项检查功能覆盖是否完整】这是本次核对的重点：
+- 请先从 README 与目录结构中列出该项目实际具备的能力清单，再与「主要功能」逐条比对。
+- 如果实际具备的能力中有 3 条以上未被「主要功能」涵盖，必须针对 mainFeatures 提出 issue，类型为“遗漏”。
+- 「主要功能」的建议内容必须是**完整的最终文本**：保留原有仍然正确的功能项，并补齐遗漏的功能项，合并为 4-8 条、分号分隔的完整列表，可直接替换原值。不要只写新增的部分。
+- 同样检查「开发目的」「技术特点」「软件说明」是否遗漏了项目的重要特征（例如支持的关键技术、面向的关键场景）；若有遗漏，也按“遗漏”提出，并给出补全后的完整文本。
+- 软著登记材料使用概括性的常规表述是正常的：不要因为“不够详细/不够独特”而报问题。判断标准是**能力有没有被覆盖到**，而不是描述得多细。
+
+其他原则：
+- 每个 issue 的 kind 取值：“错误”（与实际不符）、“遗漏”（缺少应有内容）、“不一致”（字段之间互相矛盾）、“规范”（不符合软著用语规范）。
+- suggestion 一律给出可直接替换原值的完整最终文本，不要写“建议改为……”这类前缀，不要只给增量。
+- 若某字段确实合理、无需修改，就不要为它编造问题。
 ${SOFT_COPYRIGHT_COMPLIANCE_RULES}
 
 仓库名称：${input.repoName}
-仓库地址/描述：${input.repoDescription || "无"}
+仓库描述：${input.repoDescription || "无"}
 语言统计（按代码字节占比）：${input.languages || "未知"}
 
 README（节选）：
-${input.readme ? input.readme.slice(0, 3500) : "（无 README）"}
+${input.readme ? input.readme.slice(0, 4000) : "（无 README）"}
 
 目录结构（模块划分）：
-${(input.moduleDirs || input.fileTree).slice(0, 1500)}
+${(input.moduleDirs || input.fileTree).slice(0, 2000)}
 
 代表性源文件：
-${input.fileTree.slice(0, 1200)}
+${input.fileTree.slice(0, 1500)}
 
 当前填写的登记信息（JSON）：
 ${JSON.stringify({ softwareName: input.softwareName, version: input.version, ...input.meta }, null, 2)}
 
-只返回如下 JSON（不要输出解释、不要代码围栏）。只列出确有问题的字段，没有问题就返回空数组：
+只返回如下 JSON（不要输出解释、不要代码围栏）。没有问题时 issues 返回空数组：
 {
+  "detectedCapabilities": ["从 README 和目录结构中识别出的该项目实际能力，若干条"],
+  "missingFromMainFeatures": ["上述能力中未被「主要功能」涵盖的条目，若无则空数组"],
   "issues": [
     {
-      "field": "上面 JSON 中的字段英文 key（如 purpose、runPlatform、softwareName、mainFeatures）",
+      "field": "上面 JSON 中的字段英文 key（如 mainFeatures、purpose、runPlatform、softwareName）",
+      "kind": "错误 | 遗漏 | 不一致 | 规范",
       "severity": "high | medium | low",
       "problem": "该字段现在的问题（一句话）",
-      "suggestion": "建议修改为的具体内容（直接给可用的最终文本，不要写“建议改为…”这类前缀）"
+      "suggestion": "可直接替换原值的完整最终文本"
     }
   ],
   "overallComment": "对整体填写质量的一句话总评"
@@ -538,17 +557,27 @@ export async function reviewProjectMeta(input: {
       const sevRaw = String(it.severity || "medium");
       const severity: "high" | "medium" | "low" =
         sevRaw === "high" ? "high" : sevRaw === "low" ? "low" : "medium";
+      const kindRaw = String(it.kind || "").trim();
+      const kind: MetaReviewIssue["kind"] =
+        kindRaw === "遗漏" || kindRaw === "不一致" || kindRaw === "规范" ? kindRaw : "错误";
       return {
         field,
         fieldLabel: META_FIELD_LABELS[field] || field,
+        kind,
         severity,
         problem: sanitizeSoftCopyrightText(String(it.problem || "")),
         suggestion: sanitizeSoftCopyrightText(String(it.suggestion || "")),
       };
     })
     .filter((it) => it.problem || it.suggestion);
+
+  const toStringList = (v: unknown): string[] =>
+    Array.isArray(v) ? v.map((s) => sanitizeSoftCopyrightText(String(s))).filter(Boolean) : [];
+
   return {
     issues,
+    detectedCapabilities: toStringList(parsed.detectedCapabilities),
+    missingFromMainFeatures: toStringList(parsed.missingFromMainFeatures),
     overallComment: sanitizeSoftCopyrightText(String(parsed.overallComment || "")),
   };
 }

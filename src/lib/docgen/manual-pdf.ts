@@ -157,6 +157,25 @@ export function cleanManualMarkdown(markdown: string): string {
   return out.join("\n").replace(/\n{3,}/g, "\n\n").trim();
 }
 
+/**
+ * 一般交存 requires the first 30 and last 30 consecutive pages of the document,
+ * so 60 body pages is the target deposit size. Rendering far beyond that also
+ * risks exhausting the renderer: every page is rasterised to a canvas and held
+ * in the PDF until output, and an OOM kill shows up as the browser's blank
+ * "This page couldn't load" screen with no JS error to catch.
+ */
+const MAX_BODY_PAGES = 60;
+const FRONT_PAGES = 30;
+
+/** Keep the deposit-relevant front/back pages when the manual runs long. */
+function limitBodyPages(bodyPages: string[]): { pages: string[]; trimmed: number } {
+  if (bodyPages.length <= MAX_BODY_PAGES) return { pages: bodyPages, trimmed: 0 };
+  const backCount = MAX_BODY_PAGES - FRONT_PAGES;
+  const front = bodyPages.slice(0, FRONT_PAGES);
+  const back = bodyPages.slice(-backCount);
+  return { pages: [...front, ...back], trimmed: bodyPages.length - MAX_BODY_PAGES };
+}
+
 export async function generateManualPDF(
   softwareName: string,
   version: string,
@@ -186,7 +205,13 @@ export async function generateManualPDF(
   const bodyBlocks = markdownToBlocks(cleaned);
 
   onProgress?.("正在按实际高度分页（避免底部裁切）...");
-  const bodyPages = await paginateByHeight(bodyBlocks);
+  const allBodyPages = await paginateByHeight(bodyBlocks);
+  const { pages: bodyPages, trimmed } = limitBodyPages(allBodyPages);
+  if (trimmed > 0) {
+    onProgress?.(
+      `说明书共 ${allBodyPages.length} 页，按一般交存要求保留前 ${FRONT_PAGES} 页与后 ${MAX_BODY_PAGES - FRONT_PAGES} 页（省略中间 ${trimmed} 页）...`
+    );
+  }
 
   // Soft-copyright general deposit prefers ~30+30 pages of documentation.
   // We keep natural pagination; only pad lightly if extremely short.

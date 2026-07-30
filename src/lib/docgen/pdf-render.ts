@@ -165,6 +165,44 @@ export interface RenderPDFOptions {
   extraCSS?: string;
 }
 
+/** Encode a rendered page canvas for jsPDF, preferring binary over base64. */
+async function encodeCanvas(
+  canvas: HTMLCanvasElement,
+  usePng: boolean,
+  jpegQuality: number
+): Promise<{ data: Uint8Array | string; format: "PNG" | "JPEG" }> {
+  const format = usePng ? "PNG" : "JPEG";
+  const mime = usePng ? "image/png" : "image/jpeg";
+
+  // A data URL is base64 (≈1.33× the bytes) held as a UTF-16 JS string (2 bytes
+  // per char), i.e. ~2.7× the raw image in memory — and jsPDF keeps every page
+  // until output(). For a 60–80 page manual that alone can exhaust the renderer
+  // and kill the tab. Binary keeps it at 1×.
+  const blob = await new Promise<Blob | null>((resolve) => {
+    try {
+      canvas.toBlob((b) => resolve(b), mime, usePng ? undefined : jpegQuality);
+    } catch {
+      resolve(null);
+    }
+  });
+
+  if (blob) {
+    return { data: new Uint8Array(await blob.arrayBuffer()), format };
+  }
+  // toBlob unavailable/failed — fall back to the base64 path.
+  return { data: canvas.toDataURL(mime, usePng ? undefined : jpegQuality), format };
+}
+
+/** Drop a canvas's backing store immediately instead of waiting for GC. */
+function releaseCanvas(canvas: HTMLCanvasElement) {
+  try {
+    canvas.width = 0;
+    canvas.height = 0;
+  } catch {
+    /* nothing to release */
+  }
+}
+
 /**
  * Render each page HTML (content only) into a multi-page A4 PDF.
  * Uses higher canvas scale + quality to reduce blur.
@@ -192,6 +230,7 @@ export async function renderPagesToPDF(
     iframe.style.cssText = `position:fixed;left:-10000px;top:0;width:${PAGE_WIDTH_PX}px;height:${PAGE_HEIGHT_PX}px;opacity:0;pointer-events:none;border:0;`;
     document.body.appendChild(iframe);
 
+    let canvas: HTMLCanvasElement | null = null;
     try {
       const iframeDoc = iframe.contentDocument!;
       iframeDoc.open();
@@ -201,7 +240,7 @@ export async function renderPagesToPDF(
       await iframe.contentWindow!.document.fonts.ready;
       await new Promise((r) => setTimeout(r, 120));
 
-      const canvas = await html2canvas(iframeDoc.body, {
+      canvas = await html2canvas(iframeDoc.body, {
         scale,
         useCORS: true,
         allowTaint: true,
@@ -213,16 +252,23 @@ export async function renderPagesToPDF(
         windowHeight: PAGE_HEIGHT_PX,
       });
 
-      // Prefer JPEG at high quality for smaller files; PNG for max sharpness if requested
-      if (usePng) {
-        doc.addImage(canvas.toDataURL("image/png"), "PNG", 0, 0, 210, 297);
-      } else {
-        doc.addImage(canvas.toDataURL("image/jpeg", jpegQuality), "JPEG", 0, 0, 210, 297);
-      }
+      const { data, format } = await encodeCanvas(canvas, usePng, jpegQuality);
+      doc.addImage(data, format, 0, 0, 210, 297);
     } finally {
+      if (canvas) releaseCanvas(canvas);
       document.body.removeChild(iframe);
     }
+
+    // Yield so the browser can reclaim the canvas/iframe before the next page.
+    await new Promise((r) => setTimeout(r, 0));
   }
 
-  return doc.output("blob");
+  try {
+    return doc.output("blob");
+  } catch (e) {
+    const detail = e instanceof Error ? e.message : String(e);
+    throw new Error(
+      `PDF 合成失败（共 ${pageContents.length} 页）：${detail}。页数过多可能导致浏览器内存不足，请减少内容后重试。`
+    );
+  }
 }

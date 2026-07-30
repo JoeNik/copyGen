@@ -11,6 +11,7 @@ import { useEffect, useState, useMemo } from "react";
 import { getProjects, getAIKey, getActiveProvider, deleteProject, deleteProjects, type Project } from "@/lib/storage";
 import { APP_VERSION } from "@/lib/version";
 import AISettingsModal from "@/components/AISettingsModal";
+import ErrorBoundary from "@/components/ErrorBoundary";
 
 const statusConfig: Record<string, { label: string; color: string }> = {
   PENDING: { label: "待处理", color: "bg-zinc-500/20 text-zinc-400" },
@@ -267,8 +268,10 @@ function DashboardContent() {
 
 export default function DashboardPage() {
   return (
-    <SessionProvider>
-      <DashboardContent />
-    </SessionProvider>
+    <ErrorBoundary title="控制台出错">
+      <SessionProvider>
+        <DashboardContent />
+      </SessionProvider>
+    </ErrorBoundary>
   );
 }

@@ -494,7 +494,13 @@ export function getManualDraft(projectId: string): ManualDraft | null {
 
 export function saveManualDraft(draft: ManualDraft) {
   if (typeof window === "undefined") return;
-  localStorage.setItem(draftKey(draft.projectId), JSON.stringify(draft));
+  // Draft saves happen after every chapter; a quota failure here must not abort
+  // the generation that is still producing useful text.
+  try {
+    localStorage.setItem(draftKey(draft.projectId), JSON.stringify(draft));
+  } catch {
+    /* draft is a convenience — generation continues without it */
+  }
 }
 
 export function clearManualDraft(projectId: string) {
@@ -582,11 +588,37 @@ function generateId(): string {
   return Date.now().toString(36) + Math.random().toString(36).slice(2, 8);
 }
 
+/**
+ * Write a key, surfacing quota exhaustion as a readable error.
+ *
+ * Manuals run to hundreds of KB and localStorage caps around 5 MB per origin, so
+ * a few large projects can fill it. An unhandled QuotaExceededError thrown from a
+ * render path takes the whole page down, so callers get a real message instead.
+ */
+function writeStorage(key: string, value: string) {
+  try {
+    localStorage.setItem(key, value);
+  } catch (e) {
+    const name = e instanceof Error ? e.name : "";
+    if (/quota|QUOTA_EXCEEDED/i.test(name) || /quota/i.test(String(e))) {
+      throw new Error(
+        "浏览器本地存储空间已满，无法保存。请删除不再需要的项目，或下载已生成的材料后清理，然后重试。"
+      );
+    }
+    throw e;
+  }
+}
+
 export function getProjects(): Project[] {
   if (typeof window === "undefined") return [];
   const raw = localStorage.getItem(STORAGE_KEYS.PROJECTS);
   if (!raw) return [];
-  try { return JSON.parse(raw); } catch { return []; }
+  try {
+    const parsed = JSON.parse(raw);
+    return Array.isArray(parsed) ? parsed : [];
+  } catch {
+    return [];
+  }
 }
 
 export function getProject(id: string): Project | undefined {
@@ -597,7 +629,7 @@ export function createProject(data: Omit<Project, "id" | "status" | "createdAt">
   const project: Project = { ...data, id: generateId(), status: "PENDING", createdAt: new Date().toISOString() };
   const projects = getProjects();
   projects.unshift(project);
-  localStorage.setItem(STORAGE_KEYS.PROJECTS, JSON.stringify(projects));
+  writeStorage(STORAGE_KEYS.PROJECTS, JSON.stringify(projects));
   return project;
 }
 
@@ -606,17 +638,17 @@ export function updateProject(id: string, updates: Partial<Project>) {
   const idx = projects.findIndex((p) => p.id === id);
   if (idx >= 0) {
     projects[idx] = { ...projects[idx], ...updates };
-    localStorage.setItem(STORAGE_KEYS.PROJECTS, JSON.stringify(projects));
+    writeStorage(STORAGE_KEYS.PROJECTS, JSON.stringify(projects));
   }
 }
 
 export function deleteProject(id: string) {
   const projects = getProjects().filter((p) => p.id !== id);
-  localStorage.setItem(STORAGE_KEYS.PROJECTS, JSON.stringify(projects));
+  writeStorage(STORAGE_KEYS.PROJECTS, JSON.stringify(projects));
 }
 
 export function deleteProjects(ids: string[]) {
   const idSet = new Set(ids);
   const projects = getProjects().filter((p) => !idSet.has(p.id));
-  localStorage.setItem(STORAGE_KEYS.PROJECTS, JSON.stringify(projects));
+  writeStorage(STORAGE_KEYS.PROJECTS, JSON.stringify(projects));
 }

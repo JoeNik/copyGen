@@ -1,6 +1,7 @@
 "use client";
 import Logo from "@/components/Logo";
 import ConfirmDialog from "@/components/ConfirmDialog";
+import ErrorBoundary from "@/components/ErrorBoundary";
 
 
 import { useSession } from "next-auth/react";
@@ -25,6 +26,29 @@ import {
 } from "@/lib/generation-runtime";
 
 const steps = ["读取仓库代码", "分析代码结构", "AI 生成元数据", "生成程序鉴别材料", "生成文档鉴别材料", "完成"];
+
+/** Chinese labels for metadata keys, used in 核对 messages. */
+const META_FIELD_LABELS_UI: Record<string, string> = {
+  softwareName: "软件全称",
+  version: "版本号",
+  category: "软件分类",
+  purpose: "开发目的",
+  domain: "面向领域/行业",
+  mainFeatures: "主要功能",
+  technicalFeatures: "技术特点",
+  softwareDescription: "软件说明",
+  runPlatform: "运行平台",
+  runSupport: "运行支撑环境",
+  devTools: "开发工具",
+  devHardware: "开发硬件环境",
+  runHardware: "运行硬件环境",
+  devOS: "开发操作系统",
+  languagesGiven: "编程语言（给定项）",
+  languagesExtra: "编程语言（补充项）",
+  techCategoriesGiven: "技术特点分类",
+  techCategoriesExtra: "技术特点（补充）",
+  sourceLines: "源程序行数",
+};
 
 /**
  * Mark a project as interrupted so reopen shows resume UI instead of stuck "准备中".
@@ -113,6 +137,9 @@ function ProjectDetailContent() {
   const [reviewingMeta, setReviewingMeta] = useState(false);
   const [metaReviewError, setMetaReviewError] = useState("");
   const [appliedIssues, setAppliedIssues] = useState<Record<string, boolean>>({});
+  /** Editable copies of AI suggestions, keyed by "index:field". */
+  const [suggestionDrafts, setSuggestionDrafts] = useState<Record<string, string>>({});
+  const [editingSuggestion, setEditingSuggestion] = useState<Record<string, boolean>>({});
   const [manualAudit, setManualAudit] = useState<ManualAuditResult | null>(null);
   const [auditingManual, setAuditingManual] = useState(false);
   const [auditError, setAuditError] = useState("");
@@ -474,12 +501,24 @@ function ProjectDetailContent() {
       // Step 5: Done — persist here so the result survives even if no page is mounted.
       emit({ stepIndex: 5, currentStep: "生成完成！", progress: 100 });
       clearManualDraft(projectId);
-      updateProject(projectId, {
-        status: "DONE",
-        meta: { ...snapshot.meta, sourceLines: totalSourceLines },
-        errorMsg: undefined,
-        manualMarkdown: generatedMarkdown,
-      });
+      // Persisting the manual can hit the localStorage quota. The PDFs are already
+      // rendered at this point, so report the save problem without discarding them —
+      // the user can still download the materials from this session.
+      try {
+        updateProject(projectId, {
+          status: "DONE",
+          meta: { ...snapshot.meta, sourceLines: totalSourceLines },
+          errorMsg: undefined,
+          manualMarkdown: generatedMarkdown,
+        });
+      } catch (e) {
+        const detail = e instanceof Error ? e.message : String(e);
+        updateProject(projectId, {
+          status: "DONE",
+          meta: { ...snapshot.meta, sourceLines: totalSourceLines },
+          errorMsg: `材料已生成，但说明书文稿未能保存到本地存储：${detail}`,
+        });
+      }
 
       return {
         markdown: generatedMarkdown,
@@ -515,8 +554,10 @@ function ProjectDetailContent() {
       if (finished.error) {
         setError(finished.error);
         setManualDraft(getManualDraft(projectId));
-        updateProject(projectId, { status: "FAILED", errorMsg: finished.error });
-        setProject(getProject(projectId)!);
+        try {
+          updateProject(projectId, { status: "FAILED", errorMsg: finished.error });
+        } catch { /* storage full — the in-memory error is still shown */ }
+        setProject(getProject(projectId) ?? null);
         return;
       }
 
@@ -527,10 +568,21 @@ function ProjectDetailContent() {
       setCurrentStep("生成完成！");
       setManualMarkdown(result.markdown);
       setManualDraft(null);
-      setProject(getProject(projectId)!);
-      setMeta(getProject(projectId)?.meta ?? null);
-      setCodePdfUrl(URL.createObjectURL(result.codePdf));
-      setManualPdfUrl(URL.createObjectURL(result.manualPdf));
+      const saved = getProject(projectId);
+      if (saved) {
+        setProject(saved);
+        setMeta(saved.meta);
+      }
+      // Creating object URLs can throw if the blob was released; never let that
+      // escape into the render path and blank the page.
+      try {
+        setCodePdfUrl(URL.createObjectURL(result.codePdf));
+        setManualPdfUrl(URL.createObjectURL(result.manualPdf));
+      } catch (e) {
+        setError(
+          `材料已生成，但预览链接创建失败：${e instanceof Error ? e.message : String(e)}。请点「重新导出 PDF」。`
+        );
+      }
     };
 
     const unsubscribe = subscribeToRun(projectId, sync);
@@ -834,6 +886,11 @@ function ProjectDetailContent() {
       });
       setMetaReview(result);
       setAppliedIssues({});
+      setEditingSuggestion({});
+      // Seed editable copies so each suggestion can be adjusted before applying.
+      setSuggestionDrafts(
+        Object.fromEntries(result.issues.map((issue, idx) => [`${idx}:${issue.field}`, issue.suggestion]))
+      );
     } catch (e) {
       setMetaReviewError(e instanceof Error ? e.message : "核对失败，请重试");
     } finally {
@@ -842,20 +899,25 @@ function ProjectDetailContent() {
   };
 
   /**
-   * Apply an AI suggestion. Array-valued fields (languages, tech categories) need
-   * splitting; scalar meta fields are assigned directly. Name/version live on the
-   * project rather than meta.
+   * Apply a (possibly user-edited) suggestion to the metadata.
+   *
+   * Array-valued fields (languages, tech categories) need splitting; scalar meta
+   * fields are assigned directly. Name/version live on the project rather than meta.
+   * `issueKey` is the per-row identity so two issues on the same field don't share
+   * applied/edited state.
    */
-  const handleApplySuggestion = (field: string, suggestion: string) => {
+  const handleApplySuggestion = (issueKey: string, field: string, suggestion: string) => {
     if (!meta) return;
     const value = suggestion.trim();
     if (!value) return;
+
+    const markApplied = () => setAppliedIssues((prev) => ({ ...prev, [issueKey]: true }));
 
     if (field === "softwareName" || field === "version") {
       setProjectDraft((prev) => ({ ...prev, [field]: value }));
       updateProject(projectId, { [field]: value });
       setProject(getProject(projectId)!);
-      setAppliedIssues((prev) => ({ ...prev, [field]: true }));
+      markApplied();
       return;
     }
 
@@ -866,25 +928,46 @@ function ProjectDetailContent() {
     if (field in listFields) {
       const allowed = listFields[field];
       const picked = value.split(/[,，、\s]+/).map((s) => s.trim()).filter((s) => allowed.includes(s));
-      if (picked.length) setMeta({ ...meta, [field]: picked });
-      setAppliedIssues((prev) => ({ ...prev, [field]: true }));
+      if (!picked.length) {
+        setMetaReviewError(`「${META_FIELD_LABELS_UI[field] || field}」的建议值不在可选项中，未应用：${value}`);
+        return;
+      }
+      setMeta({ ...meta, [field]: picked });
+      markApplied();
+      return;
+    }
+
+    if (field === "languagesExtra" || field === "techCategoriesExtra") {
+      const parts = value.split(/[,，、]+/).map((s) => s.trim()).filter(Boolean);
+      setMeta({ ...meta, [field]: parts });
+      markApplied();
       return;
     }
 
     if (field === "sourceLines") {
       const n = parseInt(value.replace(/[^\d]/g, ""), 10);
-      if (isFinite(n)) setMeta({ ...meta, sourceLines: n });
-      setAppliedIssues((prev) => ({ ...prev, [field]: true }));
+      if (!isFinite(n)) {
+        setMetaReviewError(`「源程序行数」的建议值无法解析为数字，未应用：${value}`);
+        return;
+      }
+      setMeta({ ...meta, sourceLines: n });
+      markApplied();
       return;
     }
 
     if (field === "category" && !SOFTWARE_CATEGORIES.includes(value)) {
-      setAppliedIssues((prev) => ({ ...prev, [field]: true }));
+      setMetaReviewError(`「软件分类」只能是 ${SOFTWARE_CATEGORIES.join(" / ")}，未应用：${value}`);
+      return;
+    }
+
+    // Unknown key from the model → don't silently write a junk field.
+    if (!(field in meta)) {
+      setMetaReviewError(`建议指向未知字段「${field}」，未应用。请手动修改对应内容。`);
       return;
     }
 
     setMeta({ ...meta, [field]: value });
-    setAppliedIssues((prev) => ({ ...prev, [field]: true }));
+    markApplied();
   };
 
   const handleAuditManual = async () => {
@@ -1384,15 +1467,45 @@ function ProjectDetailContent() {
                       <p className="text-xs text-[#5C635D]">{metaReview.overallComment}</p>
                     </div>
                   </div>
+
+                  {/* Capability coverage: shows what the repo does vs. what 主要功能 lists,
+                      so omissions are visible even when the model files no issue. */}
+                  {metaReview.detectedCapabilities.length > 0 && (
+                    <details className="mb-3 ml-6 text-xs">
+                      <summary className="cursor-pointer text-[#5C635D] hover:text-[#1F2421]">
+                        AI 识别到的项目能力（{metaReview.detectedCapabilities.length} 项）
+                        {metaReview.missingFromMainFeatures.length > 0 && (
+                          <span className="ml-1 text-[var(--color-error)]">
+                            · 其中 {metaReview.missingFromMainFeatures.length} 项未写入主要功能
+                          </span>
+                        )}
+                      </summary>
+                      <ul className="mt-2 space-y-1 pl-4">
+                        {metaReview.detectedCapabilities.map((cap, i) => {
+                          const missing = metaReview.missingFromMainFeatures.includes(cap);
+                          return (
+                            <li key={i} className={`list-disc ${missing ? "text-[var(--color-error)]" : "text-[#5C635D]"}`}>
+                              {cap}{missing ? "（未覆盖）" : ""}
+                            </li>
+                          );
+                        })}
+                      </ul>
+                    </details>
+                  )}
+
                   {metaReview.issues.length === 0 ? (
                     <p className="text-xs text-[#5C635D] pl-6">未发现明显问题。</p>
                   ) : (
                     <div className="space-y-2 pl-6">
                       {metaReview.issues.map((issue, idx) => {
-                        const applied = appliedIssues[issue.field];
+                        const issueKey = `${idx}:${issue.field}`;
+                        const applied = appliedIssues[issueKey];
+                        const draft = suggestionDrafts[issueKey] ?? issue.suggestion;
+                        const isEditing = !!editingSuggestion[issueKey];
+                        const edited = draft.trim() !== issue.suggestion.trim();
                         return (
                           <div
-                            key={idx}
+                            key={issueKey}
                             className={`border rounded-lg p-3 text-xs ${
                               applied
                                 ? "border-[var(--color-success)]/30 bg-[var(--color-success)]/5 opacity-60"
@@ -1402,7 +1515,10 @@ function ProjectDetailContent() {
                             }`}
                           >
                             <div className="flex items-start justify-between gap-2 mb-1">
-                              <span className="font-medium text-[#1F2421]">{issue.fieldLabel}</span>
+                              <span className="font-medium text-[#1F2421]">
+                                {issue.fieldLabel}
+                                <span className="ml-1.5 font-normal text-[10px] text-[#5C635D]">{issue.kind}</span>
+                              </span>
                               <span
                                 className={`px-1.5 py-0.5 rounded text-[10px] ${
                                   issue.severity === "high"
@@ -1416,18 +1532,49 @@ function ProjectDetailContent() {
                               </span>
                             </div>
                             <p className="text-[#5C635D] mb-2">问题：{issue.problem}</p>
-                            <div className="flex items-start gap-2">
-                              <p className="text-[#5C635D] flex-1 min-w-0">建议：{issue.suggestion}</p>
+
+                            <div className="text-[#5C635D] mb-1">
+                              建议{edited ? "（已手动修改）" : ""}：
+                            </div>
+                            {isEditing ? (
+                              <textarea
+                                value={draft}
+                                onChange={(e) => setSuggestionDrafts((prev) => ({ ...prev, [issueKey]: e.target.value }))}
+                                rows={4}
+                                className="w-full px-2 py-1.5 mb-2 bg-[var(--color-input-bg)] border border-[var(--color-border)] rounded text-xs leading-relaxed focus:outline-none focus:border-[var(--color-primary)]"
+                              />
+                            ) : (
+                              <p className="text-[#5C635D] mb-2 whitespace-pre-wrap">{draft}</p>
+                            )}
+
+                            <div className="flex flex-wrap items-center gap-2">
                               {!applied && (
-                                <button
-                                  onClick={() => handleApplySuggestion(issue.field, issue.suggestion)}
-                                  className="flex-shrink-0 px-2 py-1 text-[10px] border border-[var(--color-border)] rounded hover:border-[var(--color-primary)] transition-colors"
-                                >
-                                  应用
-                                </button>
+                                <>
+                                  <button
+                                    onClick={() => handleApplySuggestion(issueKey, issue.field, draft)}
+                                    disabled={!draft.trim()}
+                                    className="px-2 py-1 text-[10px] border border-[var(--color-border)] rounded hover:border-[var(--color-primary)] transition-colors disabled:opacity-50"
+                                  >
+                                    应用
+                                  </button>
+                                  <button
+                                    onClick={() => setEditingSuggestion((prev) => ({ ...prev, [issueKey]: !isEditing }))}
+                                    className="px-2 py-1 text-[10px] border border-[var(--color-border)] rounded text-[#5C635D] hover:border-[var(--color-muted)] transition-colors"
+                                  >
+                                    {isEditing ? "收起编辑" : "编辑建议"}
+                                  </button>
+                                  {edited && (
+                                    <button
+                                      onClick={() => setSuggestionDrafts((prev) => ({ ...prev, [issueKey]: issue.suggestion }))}
+                                      className="px-2 py-1 text-[10px] text-[#5C635D] hover:text-[#1F2421] transition-colors"
+                                    >
+                                      恢复原建议
+                                    </button>
+                                  )}
+                                </>
                               )}
                               {applied && (
-                                <span className="flex-shrink-0 text-[10px] text-[var(--color-success)]">✓ 已应用</span>
+                                <span className="text-[10px] text-[var(--color-success)]">✓ 已应用</span>
                               )}
                             </div>
                           </div>
@@ -1452,8 +1599,9 @@ function ProjectDetailContent() {
               </div>
               <div className="mt-4 space-y-3">
                 <EditableField label="开发目的" value={meta.purpose} onChange={(v) => setMeta({ ...meta, purpose: v })} placeholder="AI 生成中..." />
-                <EditableField label="主要功能" value={meta.mainFeatures} onChange={(v) => setMeta({ ...meta, mainFeatures: v })} placeholder="AI 生成中..." />
+                <EditableField label="主要功能" value={meta.mainFeatures} onChange={(v) => setMeta({ ...meta, mainFeatures: v })} placeholder="AI 生成中..." rows={4} />
                 <EditableField label="技术特点" value={meta.technicalFeatures} onChange={(v) => setMeta({ ...meta, technicalFeatures: v })} placeholder="AI 生成中..." />
+                <EditableField label="软件说明" value={meta.softwareDescription} onChange={(v) => setMeta({ ...meta, softwareDescription: v })} placeholder="用于登记表「软件说明」栏" />
               </div>
             </div>
 
@@ -1929,11 +2077,11 @@ function DraftTextarea({ label, value, onChange, rows = 2 }: { label: string; va
   );
 }
 
-function EditableField({ label, value, onChange, placeholder }: { label: string; value: string; onChange: (v: string) => void; placeholder?: string }) {
+function EditableField({ label, value, onChange, placeholder, rows = 2 }: { label: string; value: string; onChange: (v: string) => void; placeholder?: string; rows?: number }) {
   return (
     <div>
       <label className="block text-xs text-[var(--color-muted)] mb-1">{label}</label>
-      <textarea value={value} onChange={(e) => onChange(e.target.value)} placeholder={placeholder} rows={2}
+      <textarea value={value} onChange={(e) => onChange(e.target.value)} placeholder={placeholder} rows={rows}
         className="w-full px-3 py-2 bg-[var(--color-input-bg)] border border-[var(--color-border)] rounded-lg text-sm focus:outline-none focus:border-[var(--color-primary)] resize-none" />
     </div>
   );
@@ -1979,5 +2127,9 @@ function UploadGuide({ title, desc, file, format, onDownload }: { title: string;
 }
 
 export default function ProjectDetailPage() {
-  return <SessionProvider><ProjectDetailContent /></SessionProvider>;
+  return (
+    <ErrorBoundary title="项目详情页出错">
+      <SessionProvider><ProjectDetailContent /></SessionProvider>
+    </ErrorBoundary>
+  );
 }
