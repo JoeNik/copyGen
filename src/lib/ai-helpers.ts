@@ -12,7 +12,8 @@ const SOFT_COPYRIGHT_COMPLIANCE_RULES = `软著申报合规用语要求：
 - 涉及信俗、民俗、传统文化、节庆或非遗内容时，统一采用“民俗文化”“传统文化资料”“文化资源展示”“文化活动信息管理”等中性表述。
 - 涉及“妈祖信俗”“妈祖祭典”时，按非物质文化遗产、社会实践、仪式、节庆活动和民俗文化资料处理；可写“妈祖信俗文化”“妈祖民俗文化资料”“妈祖文化活动信息管理”，不得写成“妈祖宗教文化”“妈祖宗教活动”“互联网宗教信息服务”。
 - 不得写成互联网宗教信息服务、宗教活动组织、传教、宗教教育培训、讲经讲道、宗教仪式直播/录播、发展信徒、宗教募捐或宗教商业宣传。
-- 不得宣称祈福改运、消灾解厄、灵验、开光加持、算命占卜等功效；不要引导用户参与宗教仪式或购买宗教服务。`;
+- 不得宣称祈福改运、消灾解厄、灵验、开光加持、算命占卜等功效；不要引导用户参与宗教仪式或购买宗教服务。
+- 代码目录或组件名中若出现 fortune、bazi、divination、fengshui、qiufu 等含义的命名，不要按字面写成命理、八字、占卜、风水、求签等功能；应统一表述为「民俗文化资料展示」「传统文化知识查询」等中性功能，或不纳入本次申报范围。`;
 
 const SOFT_COPYRIGHT_TERM_REPLACEMENTS: Array<[RegExp, string]> = [
   [/妈祖宗教信仰文化/g, "妈祖信俗文化"],
@@ -41,6 +42,18 @@ const SOFT_COPYRIGHT_TERM_REPLACEMENTS: Array<[RegExp, string]> = [
   [/开光加持/g, "民俗工艺展示"],
   [/算命占卜/g, "民俗文化内容展示"],
   [/灵验/g, "文化特色"],
+  // Divination-flavoured module names leak in from real directory names
+  // (FortuneBazi*, Fortune*), and 软著 review treats them as prohibited content.
+  // Compound terms first — the list is applied in order.
+  [/生辰八字/g, "民俗文化资料"],
+  [/八字命理/g, "民俗文化资料"],
+  [/命理分析/g, "民俗文化资料展示"],
+  [/命理/g, "民俗文化"],
+  [/八字/g, "民俗文化"],
+  [/风水/g, "民俗文化"],
+  [/求签/g, "民俗文化互动"],
+  [/抽签/g, "民俗文化互动"],
+  [/占卜/g, "民俗文化内容展示"],
 ];
 
 export function sanitizeSoftCopyrightText(text: string): string {
@@ -494,6 +507,7 @@ export function buildMetaReviewPrompt(input: {
 - 每个 issue 的 kind 取值：“错误”（与实际不符）、“遗漏”（缺少应有内容）、“不一致”（字段之间互相矛盾）、“规范”（不符合软著用语规范）。
 - suggestion 一律给出可直接替换原值的完整最终文本，不要写“建议改为……”这类前缀，不要只给增量。
 - 若某字段确实合理、无需修改，就不要为它编造问题。
+- 若仓库中存在不适合写入软著申报材料的模块（例如命名涉及命理、占卜、风水、求签的目录），不要建议把它写进「主要功能」；如确需覆盖，请改用「民俗文化资料展示」这类中性表述。
 ${SOFT_COPYRIGHT_COMPLIANCE_RULES}
 
 仓库名称：${input.repoName}
@@ -626,6 +640,9 @@ ${SOFT_COPYRIGHT_COMPLIANCE_RULES}
 - 只依据下方提供的客观信息判断“是否编造”，如果文档写了下方信息里完全没有依据的具体功能/模块/错误码，判为疑似幻觉。
 - 软著说明书使用概括、程式化的表述属于正常且符合惯例，不要因为“不够详细/不够独特”而扣分或报问题。审核重点是内部矛盾与凭空编造，不是文采或信息密度。
 - 章节之间的自相矛盾（例如第五章的模块名与第六、七章不对应）比表述笼统严重得多，应优先指出。
+- 结构性重复（同一章标题或同一小节出现两次以上）属于严重问题，必须单独指出并注明重复的标题。
+- 幻觉判定要具体到“编造了什么”：编程语言、端口号、脚本/可执行文件名、精确版本号、第三方库名、硬件型号，这几类只要文档写了而下方信息中无依据，就应指出。
+- 反过来，仓库里存在但说明书没写到的目录/组件，**不一定**是问题：说明书覆盖的是本次登记的功能范围，未纳入本版本的模块可以不写。只有当缺失的模块属于登记信息「主要功能」列出的内容时，才按“完整性”提出。
 - 不要自己臆造问题；无法确定的从轻。
 - score（文档质量）与 passProbability（软著初步通过概率）都用 0–100 整数。
 
@@ -857,6 +874,64 @@ ${input.moduleDirs.join("\n").slice(0, 1000)}
 只返回选中的分类名称，逗号分隔，不要返回其他内容。`;
 }
 
+/**
+ * Distil a project description from the README rather than reusing GitHub's
+ * one-line `description` field.
+ *
+ * The GitHub field is written for browsers of the repo — often a slogan, an emoji
+ * string, or English shorthand — and it feeds 开发目的/主要功能 generation as well
+ * as the manual prompt, so a thin or promotional value degrades everything
+ * downstream. The README states what the software actually does.
+ */
+export function buildRepoSummaryPrompt(input: {
+  repoName: string;
+  githubDescription: string;
+  readme: string;
+  moduleDirs: string[];
+  languageStats: string;
+}): string {
+  return `请根据下面这个真实代码仓库的 README 与目录结构，用中文提炼一段「项目描述」，供后续撰写软件著作权登记材料时参考。
+
+要求：
+- 2-4 句，先说这个软件是什么、解决什么问题，再说它主要包含哪几类能力。
+- 只依据 README 与目录结构中的事实，不要编造没有依据的功能、平台或技术。
+- 使用正式、客观的陈述语气；不要用「本项目是一个强大的/优雅的」这类宣传语，不要用 emoji，不要用 Markdown 标记。
+- 如果 README 是英文，请输出中文。
+- 只输出这段描述本身，不要输出标题、前缀或解释。
+${SOFT_COPYRIGHT_COMPLIANCE_RULES}
+
+仓库名称：${input.repoName}
+GitHub 仓库描述（可能为空或为标语，仅作参考）：${input.githubDescription || "无"}
+语言统计：${input.languageStats || "未知"}
+
+README（节选）：
+${input.readme.slice(0, 6000) || "（无 README）"}
+
+目录结构（模块划分）：
+${input.moduleDirs.join("\n").slice(0, 1500) || "（无）"}`;
+}
+
+/**
+ * Returns a README-derived description, or "" when there's nothing to work from
+ * (callers then keep whatever they already had).
+ */
+export async function summarizeRepoDescription(input: {
+  repoName: string;
+  githubDescription: string;
+  readme: string;
+  moduleDirs: string[];
+  languageStats: string;
+}): Promise<string> {
+  if (!input.readme.trim() && !input.moduleDirs.length) return "";
+  const text = await callAIForText(buildRepoSummaryPrompt(input), 700);
+  const cleaned = text
+    .replace(/^```[a-z]*\s*/i, "")
+    .replace(/\s*```$/i, "")
+    .replace(/^(项目描述|软件描述|描述)\s*[:：]\s*/i, "")
+    .trim();
+  return sanitizeSoftCopyrightText(cleaned);
+}
+
 export interface GeneratedMetadata {
   runPlatform: string;
   runSupport: string;
@@ -997,6 +1072,11 @@ function countNonEmptyLines(text: string): number {
   return text.split("\n").filter((l) => l.trim()).length;
 }
 
+/** Non-empty line count, exported for UI that reports dedupe results. */
+export function countDocumentLines(text: string): number {
+  return countNonEmptyLines(text);
+}
+
 function sleep(ms: number) {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
@@ -1112,6 +1192,146 @@ function chapterAlreadyPresent(allText: string, title: string): boolean {
   return re.test(allText) || allText.includes(`# ${title}`);
 }
 
+/** Normalized heading text, for comparing sections across turns. */
+function headingKey(line: string): string {
+  return line.replace(/^#{1,6}\s*/, "").replace(/[\s：:、.。0-9０-９]/g, "").trim();
+}
+
+/**
+ * Split markdown into blocks at `##`-or-deeper headings, keeping any text before
+ * the first heading as block 0.
+ */
+function splitSections(text: string): { heading: string; body: string }[] {
+  const lines = text.split("\n");
+  const blocks: { heading: string; body: string }[] = [];
+  let cur: { heading: string; body: string } = { heading: "", body: "" };
+  for (const line of lines) {
+    if (/^#{2,6}\s+/.test(line.trim())) {
+      blocks.push(cur);
+      cur = { heading: line.trim(), body: "" };
+    } else {
+      cur.body += (cur.body ? "\n" : "") + line;
+    }
+  }
+  blocks.push(cur);
+  return blocks.filter((b) => b.heading || b.body.trim());
+}
+
+/**
+ * Merge a continuation turn into the chapter written so far.
+ *
+ * Models frequently ignore "continue from here" and re-emit the chapter from the
+ * top. Blind concatenation then produces the same chapter two or three times over,
+ * which reads as self-contradiction and was the single biggest quality problem in
+ * generated manuals. So: drop a repeated chapter heading, trim any literal overlap,
+ * and skip sections whose heading was already written.
+ */
+function mergeContinuation(existing: string, piece: string, title: string): string {
+  if (!existing.trim()) return piece;
+
+  let next = piece.trim();
+
+  // A repeated top-level heading means the model restarted the chapter.
+  const restarted = new RegExp(`^#\\s+.*${title.replace(/^第[一二三四五六七八九十\d]+章\s*/, "").replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}`).test(next)
+    || next.startsWith(`# ${title}`);
+  if (restarted) {
+    next = next.replace(/^#\s+[^\n]*\n?/, "").trim();
+    // If the restart is essentially the whole chapter again, keep the longer text
+    // rather than stitching two overlapping versions together.
+    const existingSections = new Set(splitSections(existing).map((s) => headingKey(s.heading)).filter(Boolean));
+    const pieceSections = splitSections(next).map((s) => headingKey(s.heading)).filter(Boolean);
+    const overlap = pieceSections.filter((h) => existingSections.has(h)).length;
+    if (pieceSections.length > 0 && overlap >= Math.max(2, Math.ceil(pieceSections.length * 0.6))) {
+      return countNonEmptyLines(next) > countNonEmptyLines(existing) ? next : existing;
+    }
+  }
+
+  // Trim a literal overlap where the model echoed the tail we fed it back.
+  const maxOverlap = Math.min(600, existing.length, next.length);
+  for (let len = maxOverlap; len >= 60; len -= 20) {
+    if (next.startsWith(existing.slice(-len))) {
+      next = next.slice(len);
+      break;
+    }
+  }
+
+  // Drop sections already present so the chapter doesn't list 「2.1 硬件要求」twice.
+  const seen = new Set(splitSections(existing).map((s) => headingKey(s.heading)).filter(Boolean));
+  const kept = splitSections(next).filter((s) => {
+    const key = headingKey(s.heading);
+    if (!key) return s.body.trim().length > 0;
+    if (seen.has(key)) return false;
+    seen.add(key);
+    return true;
+  });
+  const merged = kept.map((s) => [s.heading, s.body].filter(Boolean).join("\n")).join("\n\n").trim();
+  if (!merged) return existing;
+  return `${existing.trim()}\n\n${merged}`;
+}
+
+/**
+ * Final structural pass: keep one copy of each chapter and of each section inside
+ * it. Guards against duplication that slipped past per-turn merging (e.g. a
+ * resumed draft that already contained a partial chapter).
+ *
+ * Exported so an already-generated document can be repaired without regenerating.
+ */
+export function dedupeManualDocument(text: string): string {
+  const lines = text.split("\n");
+  const chapters: { heading: string; body: string[] }[] = [];
+  let cur: { heading: string; body: string[] } = { heading: "", body: [] };
+  for (const line of lines) {
+    const t = line.trim();
+    if (/^#\s+/.test(t) && !/^#{2,}\s+/.test(t)) {
+      chapters.push(cur);
+      cur = { heading: t, body: [] };
+    } else {
+      cur.body.push(line);
+    }
+  }
+  chapters.push(cur);
+
+  const byTitle = new Map<string, { heading: string; body: string[] }>();
+  const order: string[] = [];
+  const preamble: string[] = [];
+  for (const ch of chapters) {
+    if (!ch.heading) {
+      preamble.push(...ch.body);
+      continue;
+    }
+    const key = headingKey(ch.heading);
+    const existing = byTitle.get(key);
+    if (!existing) {
+      byTitle.set(key, ch);
+      order.push(key);
+      continue;
+    }
+    // Same chapter twice → keep the fuller version.
+    const a = existing.body.filter((l) => l.trim()).length;
+    const b = ch.body.filter((l) => l.trim()).length;
+    if (b > a) byTitle.set(key, { heading: existing.heading, body: ch.body });
+  }
+
+  const out: string[] = [];
+  const pre = preamble.join("\n").trim();
+  if (pre) out.push(pre);
+  for (const key of order) {
+    const ch = byTitle.get(key)!;
+    // Drop repeated ## sections within the chapter.
+    const seen = new Set<string>();
+    const sections = splitSections(ch.body.join("\n")).filter((s) => {
+      const k = headingKey(s.heading);
+      if (!k) return s.body.trim().length > 0;
+      if (seen.has(k)) return false;
+      seen.add(k);
+      return true;
+    });
+    const body = sections.map((s) => [s.heading, s.body].filter(Boolean).join("\n")).join("\n\n").trim();
+    out.push([ch.heading, body].filter(Boolean).join("\n\n"));
+  }
+  return out.join("\n\n").trim();
+}
+
 export async function generateManualMarkdown(
   softwareName: string,
   version: string,
@@ -1139,7 +1359,7 @@ export async function generateManualMarkdown(
 - 运行平台：${meta.runPlatform || "跨平台"}
 - 运行环境：${meta.runSupport || "见依赖"}
 - 编程语言：${languages || "未知"}
-- 仓库描述：${repoDescription || "无"}
+- 项目描述：${repoDescription || "无"}
 
 代码结构（节选）：
 ${fileTree.slice(0, 2500)}
@@ -1151,11 +1371,18 @@ ${codeSummary.slice(0, 3000)}`;
 规则：
 1. 只输出 Markdown 正文，不要输出目录，不要输出 JSON，不要用代码围栏包裹全文
 2. 使用正式中文说明文风，面向操作、条理清晰；采用软著说明书的常规程式化表述即可，不需要追求独特文采
-3. 一级标题必须使用给定的章节标题（以 # 开头）
+3. 一级标题必须使用给定的章节标题（以 # 开头），且整篇文档中该标题只出现一次
 4. 可用 ## / ### 作为小节；图片用 [图章号-序号：描述] 占位
-5. 本请求只写当前这一章，不要写其他章，不要重复已写章节
+5. 本请求只写当前这一章，不要写其他章，不要重复已写章节；不要在同一章里把相同小节写两遍
 6. 一次尽量写完整、详实（目标约 200–400 行文档），不要只写一两百字就结束
 7. 功能模块、界面元素、错误码等具名内容必须与「软件信息」中的主要功能保持一致，全文前后统一；不要引入软件信息里没有提到的模块名，否则各章之间会互相矛盾
+
+【严禁编造具体事实】以下内容只有在「软件信息」或代码结构中有依据时才可以写，否则必须改用概括表述：
+- 编程语言与运行时：只能写「编程语言」一栏中列出的语言。不要因为提到 NFC、移动端等就自行添加 Kotlin/Java/Swift 等语言。
+- 端口号、IP、数据库名、具体版本号（如 5432、8080、Node.js 18.20.0）：没有依据时写「按部署环境配置的服务端口」「参见运行支撑环境要求」这类表述。
+- 安装脚本、可执行文件名、命令（如 setup.exe、install.sh、check_env.sh、npm run seed）：没有依据时描述操作步骤本身（「运行安装程序」「执行项目提供的启动命令」），不要虚构文件名。
+- 第三方库名、协议名、硬件型号：同上，没有依据不要写。
+这些编造出来的细节是软著审核退回的主要原因，宁可概括也不要具体错。
 ${SOFT_COPYRIGHT_COMPLIANCE_RULES}`;
 
   let allText = opts.resumeMarkdown || "";
@@ -1210,6 +1437,20 @@ ${SOFT_COPYRIGHT_COMPLIANCE_RULES}`;
       `正在生成 ${chapter.title}（${ci + 1}/${MANUAL_CHAPTERS.length}）... 已累计 ${countNonEmptyLines(allText)} 行文档`
     );
 
+    // Feed forward what earlier chapters already established. Without this each
+    // chapter invents its own module names and error codes, and the audit reads
+    // the result as self-contradictory.
+    const priorOutline = allText
+      ? splitSections(allText)
+          .map((s) => s.heading)
+          .filter(Boolean)
+          .slice(-60)
+          .join("\n")
+      : "";
+    const continuityBlock = priorOutline
+      ? `\n已写章节的小节标题（本章必须沿用其中的模块名与术语，不要另起名字，也不要重复这些小节）：\n${priorOutline}\n`
+      : "";
+
     const userPrompt = `请只撰写以下这一章的完整 Markdown（不要目录、不要其它章）：
 
 # ${chapter.title}
@@ -1217,7 +1458,7 @@ ${SOFT_COPYRIGHT_COMPLIANCE_RULES}`;
 本章应覆盖：${chapter.outline}
 
 ${contextBlock}
-
+${continuityBlock}
 硬性要求：
 - 首行必须是：# ${chapter.title}
 - 正文不少于约 ${chapter.minLines} 行（非空行），内容详实
@@ -1234,6 +1475,9 @@ ${contextBlock}
     while (innerRound < MAX_INNER) {
       innerRound++;
       attempt++;
+      const writtenSections = chapterText
+        ? splitSections(chapterText).map((s) => s.heading).filter(Boolean).join("\n")
+        : "";
       const messages =
         chapterText.trim().length === 0
           ? [
@@ -1246,7 +1490,7 @@ ${contextBlock}
               { role: "assistant", content: chapterText.slice(-10000) },
               {
                 role: "user",
-                content: `本章目前约 ${countNonEmptyLines(chapterText)} 行，目标约 ${chapter.minLines} 行。请紧接上文继续写本章剩余内容，不要重复已写小节，不要开始下一章。`,
+                content: `本章目前约 ${countNonEmptyLines(chapterText)} 行，目标约 ${chapter.minLines} 行。\n\n本章已经写完的小节：\n${writtenSections || "（无小节标题）"}\n\n请紧接上文继续写本章**剩余**内容：不要重写「# ${chapter.title}」标题，不要重复上面列出的小节，不要开始下一章。如果本章内容已经写完整了，只回复「本章已完成」四个字。`,
               },
             ];
 
@@ -1261,11 +1505,14 @@ ${contextBlock}
           onProgress?.(`${chapter.title} 本轮空响应，重试内轮 ${innerRound}/${MAX_INNER}...`);
           continue;
         }
-        if (!chapterText) chapterText = piece;
-        else {
-          const tail = chapterText.slice(-180);
-          chapterText += tail && piece.startsWith(tail) ? piece.slice(tail.length) : `\n${piece}`;
+        // Model signalled completion instead of padding — take it.
+        if (chapterText && /^本章已完成[。.\s]*$/.test(piece.trim())) {
+          onProgress?.(`${chapter.title} 已写完（模型确认）`);
+          break;
         }
+        // Merging rather than concatenating: models often restart the chapter from
+        // its heading, which used to triple the same content into the document.
+        chapterText = chapterText ? mergeContinuation(chapterText, piece, chapter.title) : piece;
 
         const lines = countNonEmptyLines(chapterText);
         const truncated =
@@ -1296,6 +1543,13 @@ ${contextBlock}
     // Ensure chapter heading exists once
     if (!/^#\s+/.test(chapterText.trim())) {
       chapterText = `# ${chapter.title}\n\n${chapterText}`;
+    }
+
+    // A resumed draft may already hold a partial version of this chapter; replace
+    // it instead of appending a second copy.
+    if (chapterAlreadyPresent(allText, chapter.title)) {
+      const stale = extractChapter(allText, chapter.title);
+      if (stale) allText = allText.replace(stale, "").trim();
     }
 
     allText = [allText.trim(), chapterText.trim()].filter(Boolean).join("\n\n") + "\n\n";
@@ -1335,7 +1589,14 @@ ${contextBlock}
     clearManualDraft(opts.projectId);
   }
 
-  return sanitizeSoftCopyrightText(allText.trim()) + "\n";
+  // Final structural pass: one copy of each chapter, one copy of each section.
+  const deduped = dedupeManualDocument(allText);
+  const removed = countNonEmptyLines(allText) - countNonEmptyLines(deduped);
+  if (removed > 0) {
+    onProgress?.(`已清理重复章节/小节 ${removed} 行`);
+  }
+
+  return sanitizeSoftCopyrightText(deduped) + "\n";
 }
 
 function extractChapter(allText: string, title: string): string {

@@ -11,6 +11,29 @@ export interface ChangelogEntry {
 
 export const CHANGELOG: ChangelogEntry[] = [
   {
+    "hash": "57d6f28",
+    "date": "2026-07-30",
+    "subject": "feat: version badge with changelog; fix source line count",
+    "details": [
+      "源程序量 showed ~200 lines because it summed only the files actually downloaded",
+      "for the code appendix — fetchRepoFiles caps at 200 files / 500k chars, so any",
+      "repo past the cap was reported at the cap instead of its real size.",
+      "Count lines from downloaded files and estimate the rest from tree blob sizes,",
+      "calibrating bytes-per-line against this repo's own sampled files",
+      "Base the pre-generation estimate on code files only; counting lock files,",
+      "JSON fixtures and SVGs inflated the number",
+      "Stop treating an empty file as one line, and report read failures instead of",
+      "silently counting failed fetches as empty files",
+      "Version badge:",
+      "Show the version in the header of every page, not just the dashboard",
+      "Clicking it opens a changelog built from the git log at commit time by",
+      "scripts/gen-changelog.cjs (run from the pre-commit hook). Baking it in avoids",
+      "the unauthenticated GitHub API rate limit and works offline.",
+      "Each entry links to its commit on GitHub",
+      "Also point the footer/header GitHub links at the current repo."
+    ]
+  },
+  {
     "hash": "9b15670",
     "date": "2026-07-30",
     "subject": "fix: normalize persisted project metadata on read",

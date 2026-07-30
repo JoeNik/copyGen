@@ -479,3 +479,76 @@ export async function fetchRepoStats(
 
   return { allFilePaths, languages, estimatedLines, totalTreeSize: tree.length };
 }
+
+/**
+ * Re-estimate 源程序量 without doing a full generation run.
+ *
+ * The cheap path (`fetchRepoStats`) divides total code bytes by a fixed 34
+ * bytes/line, which is off by a lot for languages that differ from that average.
+ * Here we sample real files spread across the repo, measure this project's own
+ * bytes-per-line after comment stripping, and apply that ratio to every code
+ * file. Sampling keeps it to ~25 content requests instead of hundreds.
+ */
+export async function estimateRepoSourceLines(
+  token: string,
+  owner: string,
+  repo: string,
+  branch: string,
+  onProgress?: (msg: string) => void
+): Promise<{
+  sourceLines: number;
+  codeFileCount: number;
+  sampledFileCount: number;
+  bytesPerLine: number;
+}> {
+  onProgress?.("正在读取仓库文件树...");
+  const fullTree = await fetchTree(token, owner, repo, branch);
+  const codeFiles = filterByLanguageRatio(fullTree).filter((f) => (f.size || 0) > 0);
+  if (codeFiles.length === 0) {
+    return { sourceLines: 0, codeFileCount: 0, sampledFileCount: 0, bytesPerLine: 34 };
+  }
+
+  // Spread the sample across the whole list so one directory of oddly formatted
+  // files can't dominate the ratio.
+  const SAMPLE_SIZE = 25;
+  const step = Math.max(1, Math.floor(codeFiles.length / SAMPLE_SIZE));
+  const sample: GitHubFile[] = [];
+  for (let i = 0; i < codeFiles.length && sample.length < SAMPLE_SIZE; i += step) {
+    sample.push(codeFiles[i]);
+  }
+
+  onProgress?.(`正在抽样 ${sample.length} 个文件以校准行数...`);
+  let sampledBytes = 0;
+  let sampledLines = 0;
+  let sampledOk = 0;
+  const BATCH = 10;
+  for (let i = 0; i < sample.length; i += BATCH) {
+    const batch = sample.slice(i, i + BATCH);
+    const results = await Promise.all(
+      batch.map(async (f) => {
+        const { content, ok } = await fetchContent(token, owner, repo, f.path);
+        return { size: f.size || 0, lines: countLines(stripComments(content, f.path)), ok };
+      })
+    );
+    for (const r of results) {
+      if (!r.ok || r.lines === 0) continue;
+      sampledOk++;
+      sampledBytes += r.size;
+      sampledLines += r.lines;
+    }
+  }
+
+  let bytesPerLine = 34;
+  if (sampledLines > 0 && sampledBytes > 0) {
+    const observed = sampledBytes / sampledLines;
+    if (observed >= 8 && observed <= 200) bytesPerLine = observed;
+  }
+
+  const totalBytes = codeFiles.reduce((sum, f) => sum + (f.size || 0), 0);
+  return {
+    sourceLines: Math.round(totalBytes / bytesPerLine),
+    codeFileCount: codeFiles.length,
+    sampledFileCount: sampledOk,
+    bytesPerLine: Math.round(bytesPerLine * 10) / 10,
+  };
+}

@@ -11,8 +11,8 @@ import { useRouter, useParams } from "next/navigation";
 import { useEffect, useState, useCallback } from "react";
 import Link from "next/link";
 import { getProject, updateProject, getAIKey, getManualDraft, saveManualDraft, clearManualDraft, type Project, type SoftwareMeta, type ManualDraft } from "@/lib/storage";
-import { fetchRepoBranches, fetchRepoFiles, fetchRepoStats, fetchRepoLanguages, fetchRepoInsights, fetchRepo, type GitHubBranch } from "@/lib/github";
-import { generateManualMarkdown, callAIForText, generateProjectMetadata, sanitizeSoftCopyrightText, reviewProjectMeta, auditManualMarkdown, buildTechCategoriesFromInsightsPrompt, type MetaReviewResult, type ManualAuditResult } from "@/lib/ai-helpers";
+import { fetchRepoBranches, fetchRepoFiles, fetchRepoStats, fetchRepoLanguages, fetchRepoInsights, fetchRepo, estimateRepoSourceLines, type GitHubBranch } from "@/lib/github";
+import { generateManualMarkdown, callAIForText, generateProjectMetadata, sanitizeSoftCopyrightText, reviewProjectMeta, auditManualMarkdown, buildTechCategoriesFromInsightsPrompt, summarizeRepoDescription, dedupeManualDocument, countDocumentLines, type MetaReviewResult, type ManualAuditResult } from "@/lib/ai-helpers";
 import { generateCodePDF } from "@/lib/docgen/code-pdf";
 import { generateManualPDF } from "@/lib/docgen/manual-pdf";
 import { parseUserAgent, detectDevTools, mapLinguistToGivenLanguages, describeLanguageStats, GIVEN_LANGUAGES, GIVEN_TECH_CATEGORIES, SOFTWARE_CATEGORIES } from "@/lib/utils";
@@ -132,6 +132,9 @@ function ProjectDetailContent() {
   const [branchesLoadAttempted, setBranchesLoadAttempted] = useState(false);
   const [savingProject, setSavingProject] = useState(false);
   const [refreshingRepoDesc, setRefreshingRepoDesc] = useState(false);
+  const [summarizingRepoDesc, setSummarizingRepoDesc] = useState(false);
+  const [recountingLines, setRecountingLines] = useState(false);
+  const [recountNote, setRecountNote] = useState("");
 
   // AI 核对项目信息 / 审核说明书
   const [metaReview, setMetaReview] = useState<MetaReviewResult | null>(null);
@@ -327,6 +330,26 @@ function ProjectDetailContent() {
             moduleDirs: insights.moduleDirs.join("\n").slice(0, 2000),
           },
         });
+
+        // Distil the description from the README rather than trusting GitHub's
+        // one-liner: it's often a slogan, and everything downstream (metadata,
+        // manual chapters) reads this field.
+        if (insights.readme.trim() || insights.moduleDirs.length) {
+          setDetectStatus("AI 正在提炼项目描述...");
+          try {
+            const summary = await summarizeRepoDescription({
+              repoName: project.repoName,
+              githubDescription: repoDescription,
+              readme: insights.readme,
+              moduleDirs: insights.moduleDirs,
+              languageStats: languageStatsText,
+            });
+            if (summary) {
+              repoDescription = summary;
+              updateProject(projectId, { repoDescription: summary });
+            }
+          } catch { /* fall back to the GitHub description */ }
+        }
 
         setDetectStatus("AI 正在分析项目用途与功能...");
         const generated = await generateProjectMetadata({
@@ -704,6 +727,113 @@ function ProjectDetailContent() {
     }
   };
 
+  /**
+   * Distil the description from the README instead of copying GitHub's one-liner.
+   * The GitHub field is usually a slogan; this description feeds 开发目的/主要功能
+   * generation and the manual prompt, so a substantive one improves everything after.
+   */
+  const handleSummarizeRepoDescription = async () => {
+    if (!project || !accessToken) return;
+    setSummarizingRepoDesc(true);
+    setError("");
+    try {
+      let ctx = project.reviewContext;
+      let moduleDirs = ctx?.moduleDirs ? ctx.moduleDirs.split("\n").filter(Boolean) : [];
+      let readme = ctx?.readme || "";
+      let languages = ctx?.languages || "";
+
+      // Older projects have no stored context — read what we need now.
+      if (!readme) {
+        if (!project.defaultBranch.trim()) throw new Error("项目未指定代码分支");
+        const { allFilePaths } = await fetchRepoStats(
+          accessToken, project.repoOwner, project.repoName, project.defaultBranch
+        );
+        const insights = await fetchRepoInsights(
+          accessToken, project.repoOwner, project.repoName, project.defaultBranch, allFilePaths
+        );
+        const langStats = await fetchRepoLanguages(accessToken, project.repoOwner, project.repoName);
+        readme = insights.readme;
+        moduleDirs = insights.moduleDirs;
+        languages = describeLanguageStats(langStats);
+        ctx = {
+          fileTree: insights.sourcePaths.slice(0, 60).join("\n"),
+          languages,
+          codeSummary: insights.manifests
+            .map((m) => `--- ${m.path} ---\n${m.content.slice(0, 1200)}`)
+            .join("\n\n"),
+          readme: readme.slice(0, 4000),
+          moduleDirs: moduleDirs.join("\n").slice(0, 2000),
+        };
+        updateProject(projectId, { reviewContext: ctx });
+        setProject(getProject(projectId)!);
+      }
+
+      const summary = await summarizeRepoDescription({
+        repoName: project.repoName,
+        githubDescription: project.repoDescription || "",
+        readme,
+        moduleDirs,
+        languageStats: languages,
+      });
+      if (!summary) {
+        setError("AI 未能从 README 提炼出描述，请手动填写");
+        return;
+      }
+      setProjectDraft((prev) => ({ ...prev, repoDescription: summary }));
+    } catch (e) {
+      setError(e instanceof Error ? e.message : "AI 提炼项目描述失败");
+    } finally {
+      setSummarizingRepoDesc(false);
+    }
+  };
+
+  /**
+   * Re-estimate 源程序量 without a full regeneration.
+   *
+   * Samples real files to calibrate bytes-per-line for this repo, then applies the
+   * ratio to every code file — the cheap tree-only estimate uses a fixed 34
+   * bytes/line and can be off by a wide margin.
+   */
+  const handleRecountSourceLines = async () => {
+    if (!project || !accessToken) return;
+    if (!project.defaultBranch.trim()) {
+      setError("项目未指定代码分支");
+      return;
+    }
+    setRecountingLines(true);
+    setRecountNote("");
+    setError("");
+    try {
+      const branch = editingProject ? projectDraft.branch.trim() || project.defaultBranch : project.defaultBranch;
+      const result = await estimateRepoSourceLines(
+        accessToken, project.repoOwner, project.repoName, branch,
+        (msg) => setRecountNote(msg)
+      );
+      if (!result.sourceLines) {
+        setRecountNote("");
+        setError("未统计到代码文件，请检查分支是否正确");
+        return;
+      }
+      // Land in whichever copy the user is looking at.
+      if (editingProject && metaDraft) {
+        setMetaDraft({ ...metaDraft, sourceLines: result.sourceLines });
+      } else if (meta) {
+        const next = { ...meta, sourceLines: result.sourceLines };
+        setMeta(next);
+        updateProject(projectId, { meta: next });
+        setProject(getProject(projectId)!);
+      }
+      setRecountNote(
+        `已重新估算：${result.sourceLines} 行（代码文件 ${result.codeFileCount} 个，抽样 ${result.sampledFileCount} 个校准，约 ${result.bytesPerLine} 字节/行）`
+      );
+    } catch (e) {
+      setRecountNote("");
+      setError(e instanceof Error ? e.message : "重新估算源程序行数失败");
+    } finally {
+      setRecountingLines(false);
+    }
+  };
+
   const handleSaveProjectEdit = () => {
     if (!project || !meta) return;
     const softwareName = projectDraft.softwareName.trim();
@@ -846,6 +976,9 @@ function ProjectDetailContent() {
 
   const handleReviewMeta = async () => {
     if (!project || !meta) return;
+    // While 编辑项目 is open the draft holds the values the user is actually
+    // working on — review those, not the last-saved copy.
+    const target = editingProject && metaDraft ? metaDraft : meta;
     setReviewingMeta(true);
     setMetaReviewError("");
     setMetaReview(null);
@@ -879,15 +1012,15 @@ function ProjectDetailContent() {
       }
 
       const result = await reviewProjectMeta({
-        softwareName: project.softwareName,
-        version: project.version,
+        softwareName: editingProject ? projectDraft.softwareName : project.softwareName,
+        version: editingProject ? projectDraft.version : project.version,
         repoName: project.repoName,
-        repoDescription: project.repoDescription || "",
+        repoDescription: (editingProject ? projectDraft.repoDescription : project.repoDescription) || "",
         languages: ctx.languages,
         fileTree: ctx.fileTree,
         readme: ctx.readme || "",
         moduleDirs: ctx.moduleDirs || "",
-        meta: meta as unknown as Record<string, unknown>,
+        meta: target as unknown as Record<string, unknown>,
       });
       setMetaReview(result);
       setAppliedIssues({});
@@ -910,18 +1043,32 @@ function ProjectDetailContent() {
    * fields are assigned directly. Name/version live on the project rather than meta.
    * `issueKey` is the per-row identity so two issues on the same field don't share
    * applied/edited state.
+   *
+   * When 「编辑项目」 is open, writes go to `metaDraft` so they land in the form the
+   * user is looking at and are saved together with the rest of their edits;
+   * otherwise they go straight to the live meta.
    */
   const handleApplySuggestion = (issueKey: string, field: string, suggestion: string) => {
     if (!meta) return;
     const value = suggestion.trim();
     if (!value) return;
 
+    const editing = editingProject && !!metaDraft;
+    const base: SoftwareMeta = editing ? metaDraft! : meta;
+    const writeMeta = (next: SoftwareMeta) => {
+      if (editing) setMetaDraft(next);
+      else setMeta(next);
+    };
+
     const markApplied = () => setAppliedIssues((prev) => ({ ...prev, [issueKey]: true }));
 
     if (field === "softwareName" || field === "version") {
       setProjectDraft((prev) => ({ ...prev, [field]: value }));
-      updateProject(projectId, { [field]: value });
-      setProject(getProject(projectId)!);
+      // While editing, saving the form persists it — don't write behind the form.
+      if (!editing) {
+        updateProject(projectId, { [field]: value });
+        setProject(getProject(projectId)!);
+      }
       markApplied();
       return;
     }
@@ -937,14 +1084,14 @@ function ProjectDetailContent() {
         setMetaReviewError(`「${META_FIELD_LABELS_UI[field] || field}」的建议值不在可选项中，未应用：${value}`);
         return;
       }
-      setMeta({ ...meta, [field]: picked });
+      writeMeta({ ...base, [field]: picked });
       markApplied();
       return;
     }
 
     if (field === "languagesExtra" || field === "techCategoriesExtra") {
       const parts = value.split(/[,，、]+/).map((s) => s.trim()).filter(Boolean);
-      setMeta({ ...meta, [field]: parts });
+      writeMeta({ ...base, [field]: parts });
       markApplied();
       return;
     }
@@ -955,7 +1102,7 @@ function ProjectDetailContent() {
         setMetaReviewError(`「源程序行数」的建议值无法解析为数字，未应用：${value}`);
         return;
       }
-      setMeta({ ...meta, sourceLines: n });
+      writeMeta({ ...base, sourceLines: n });
       markApplied();
       return;
     }
@@ -966,19 +1113,19 @@ function ProjectDetailContent() {
     }
 
     // Unknown key from the model → don't silently write a junk field.
-    if (!(field in meta)) {
+    if (!(field in base)) {
       setMetaReviewError(`建议指向未知字段「${field}」，未应用。请手动修改对应内容。`);
       return;
     }
 
     // Every remaining known key is a string field; an array-typed one would
     // break the UI's .join()/.includes() calls, so refuse rather than corrupt it.
-    if (Array.isArray((meta as unknown as Record<string, unknown>)[field])) {
-      setMetaReviewError(`「${META_FIELD_LABELS_UI[field] || field}」需要选择项而非文本，未应用。请在「编辑项目」中手动勾选。`);
+    if (Array.isArray((base as unknown as Record<string, unknown>)[field])) {
+      setMetaReviewError(`「${META_FIELD_LABELS_UI[field] || field}」需要选择项而非文本，未应用。请手动勾选。`);
       return;
     }
 
-    setMeta({ ...meta, [field]: value });
+    writeMeta({ ...base, [field]: value });
     markApplied();
   };
 
@@ -1032,6 +1179,42 @@ function ProjectDetailContent() {
     } finally {
       setAuditingManual(false);
     }
+  };
+
+  /**
+   * Repair an already-generated document by collapsing duplicated chapters and
+   * sections. Older documents were produced before continuation merging existed,
+   * so the same chapter can appear two or three times — the single biggest source
+   * of "自相矛盾" in audit results.
+   */
+  const handleDedupeManual = () => {
+    if (!project) return;
+    const md = manualMarkdown || project.manualMarkdown || "";
+    if (!md.trim()) {
+      setAuditError("没有可清理的说明书内容");
+      return;
+    }
+    const cleaned = dedupeManualDocument(md);
+    const removed = countDocumentLines(md) - countDocumentLines(cleaned);
+    if (removed <= 0) {
+      setAuditError("未发现重复的章节或小节");
+      return;
+    }
+    requestConfirm({
+      title: "清理重复章节？",
+      message: `检测到 ${removed} 行重复内容（重复的章节或小节）。清理后文稿会被替换，PDF 需要重新导出。`,
+      confirmLabel: "清理并保存",
+      destructive: true,
+      run: () => {
+        setManualMarkdown(cleaned);
+        updateProject(projectId, { manualMarkdown: cleaned });
+        setProject(getProject(projectId)!);
+        // The exported PDF no longer matches the text.
+        if (manualPdfUrl) { URL.revokeObjectURL(manualPdfUrl); setManualPdfUrl(null); }
+        setAuditError("");
+        setCurrentStep(`已清理 ${removed} 行重复内容，请重新导出 PDF`);
+      },
+    });
   };
 
   const handleReexportManualPDF = async () => {
@@ -1235,31 +1418,87 @@ function ProjectDetailContent() {
                 ) : null}
 
                 <div>
-                  <div className="flex items-center justify-between mb-1">
-                    <label className="block text-xs text-[var(--color-muted)]">仓库描述（用于 AI 分析项目用途）</label>
-                    <button
-                      type="button"
-                      onClick={handleRefreshRepoDescription}
-                      disabled={refreshingRepoDesc || !accessToken}
-                      className="text-xs text-[var(--color-primary)] hover:underline disabled:opacity-50"
-                    >
-                      {refreshingRepoDesc ? "获取中..." : "从 GitHub 获取"}
-                    </button>
+                  <div className="flex items-center justify-between mb-1 gap-2">
+                    <label className="block text-xs text-[var(--color-muted)]">项目描述（用于 AI 分析项目用途）</label>
+                    <div className="flex items-center gap-3">
+                      <button
+                        type="button"
+                        onClick={handleSummarizeRepoDescription}
+                        disabled={summarizingRepoDesc || !accessToken}
+                        className="text-xs text-[var(--color-primary)] hover:underline disabled:opacity-50"
+                        title="根据 README 与目录结构提炼项目描述"
+                      >
+                        {summarizingRepoDesc ? "AI 提炼中..." : "AI 从 README 提炼"}
+                      </button>
+                      <button
+                        type="button"
+                        onClick={handleRefreshRepoDescription}
+                        disabled={refreshingRepoDesc || !accessToken}
+                        className="text-xs text-[var(--color-muted)] hover:text-[var(--color-foreground)] hover:underline disabled:opacity-50"
+                        title="直接取 GitHub 仓库简介（通常只有一句标语）"
+                      >
+                        {refreshingRepoDesc ? "获取中..." : "取 GitHub 简介"}
+                      </button>
+                    </div>
                   </div>
                   <textarea
                     value={projectDraft.repoDescription}
                     onChange={(e) => setProjectDraft((prev) => ({ ...prev, repoDescription: e.target.value }))}
-                    rows={2}
-                    placeholder="GitHub 仓库描述，留空则 AI 只依据 README 和目录结构判断"
+                    rows={3}
+                    placeholder="建议用「AI 从 README 提炼」生成：GitHub 简介通常只是一句标语，信息量不足"
                     className="w-full px-3 py-2 bg-[var(--color-input-bg)] border border-[var(--color-border)] rounded-lg text-sm focus:outline-none focus:border-[var(--color-primary)] resize-none"
                   />
+                  <p className="text-xs text-[var(--color-muted)] mt-1">
+                    这段描述会作为撰写说明书和判断开发目的、主要功能的依据，写得具体一些效果更好。
+                  </p>
                 </div>
 
                 {/* Full registration metadata — everything filled at creation time
                     is editable here so mistakes can be corrected without recreating. */}
                 {metaDraft && (
                   <div className="border-t border-[var(--color-border)] pt-4 space-y-4">
-                    <h3 className="text-sm font-medium">登记信息（创建时填写，可修改）</h3>
+                    <div className="flex items-start justify-between gap-4">
+                      <h3 className="text-sm font-medium">登记信息（创建时填写，可修改）</h3>
+                      <button
+                        type="button"
+                        onClick={handleReviewMeta}
+                        disabled={reviewingMeta}
+                        className="px-3 py-1.5 text-xs border border-[var(--color-border)] rounded-lg hover:border-[var(--color-primary)] transition-colors disabled:opacity-50 flex items-center gap-1.5"
+                        title="AI 核对下面填写的登记信息"
+                      >
+                        {reviewingMeta ? (
+                          <>
+                            <div className="spinner w-3 h-3 border border-[var(--color-primary)] border-t-transparent rounded-full" />
+                            AI 核对中...
+                          </>
+                        ) : (
+                          <>
+                            <svg className="w-3.5 h-3.5" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+                              <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M9 12l2 2 4-4m6 2a9 9 0 11-18 0 9 9 0 0118 0z" />
+                            </svg>
+                            AI 核对
+                          </>
+                        )}
+                      </button>
+                    </div>
+
+                    {metaReviewError && (
+                      <div className="bg-[var(--color-error)]/10 border border-[var(--color-error)]/20 rounded-lg p-3 text-xs text-[var(--color-error)]">
+                        {metaReviewError}
+                      </div>
+                    )}
+
+                    {/* Applying a suggestion here writes into metaDraft, so it shows up
+                        in the fields below and is saved with the rest of the form. */}
+                    <MetaReviewPanel
+                      review={metaReview}
+                      appliedIssues={appliedIssues}
+                      suggestionDrafts={suggestionDrafts}
+                      editingSuggestion={editingSuggestion}
+                      onDraftChange={(key, value) => setSuggestionDrafts((prev) => ({ ...prev, [key]: value }))}
+                      onToggleEdit={(key) => setEditingSuggestion((prev) => ({ ...prev, [key]: !prev[key] }))}
+                      onApply={handleApplySuggestion}
+                    />
 
                     <div className="grid grid-cols-2 gap-4">
                       <div>
@@ -1273,13 +1512,27 @@ function ProjectDetailContent() {
                         </select>
                       </div>
                       <div>
-                        <label className="block text-xs text-[var(--color-muted)] mb-1">源程序行数</label>
+                        <div className="flex items-center justify-between mb-1 gap-2">
+                          <label className="block text-xs text-[var(--color-muted)]">源程序行数</label>
+                          <button
+                            type="button"
+                            onClick={handleRecountSourceLines}
+                            disabled={recountingLines || !accessToken}
+                            className="text-xs text-[var(--color-primary)] hover:underline disabled:opacity-50"
+                            title="抽样读取仓库代码，重新估算源程序量"
+                          >
+                            {recountingLines ? "统计中..." : "重新估算"}
+                          </button>
+                        </div>
                         <input
                           type="number"
                           value={metaDraft.sourceLines || 0}
                           onChange={(e) => setMetaDraft({ ...metaDraft, sourceLines: parseInt(e.target.value, 10) || 0 })}
                           className="w-full px-3 py-2 bg-[var(--color-input-bg)] border border-[var(--color-border)] rounded-lg text-sm focus:outline-none focus:border-[var(--color-primary)]"
                         />
+                        {recountNote && (
+                          <p className="text-xs text-[var(--color-muted)] mt-1">{recountNote}</p>
+                        )}
                       </div>
                     </div>
 
@@ -1465,140 +1718,23 @@ function ProjectDetailContent() {
                 <p className="text-xs text-[var(--color-error)] mb-4">{detectStatus}</p>
               )}
 
-              {metaReviewError && (
+              {metaReviewError && !editingProject && (
                 <div className="mb-4 bg-[var(--color-error)]/10 border border-[var(--color-error)]/20 rounded-lg p-3 text-xs text-[var(--color-error)]">
                   {metaReviewError}
                 </div>
               )}
 
-              {metaReview && (
-                <div className="mb-4 bg-[#F2E3D6] border border-[#C4612F]/20 rounded-lg p-4">
-                  <div className="flex items-start gap-2 mb-3">
-                    <svg className="w-4 h-4 text-[#C4612F] flex-shrink-0 mt-0.5" fill="none" viewBox="0 0 24 24" stroke="currentColor">
-                      <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M9 12l2 2 4-4m6 2a9 9 0 11-18 0 9 9 0 0118 0z" />
-                    </svg>
-                    <div className="min-w-0 flex-1">
-                      <div className="text-xs font-medium text-[#1F2421] mb-1">AI 核对结果</div>
-                      <p className="text-xs text-[#5C635D]">{metaReview.overallComment}</p>
-                    </div>
-                  </div>
-
-                  {/* Capability coverage: shows what the repo does vs. what 主要功能 lists,
-                      so omissions are visible even when the model files no issue. */}
-                  {metaReview.detectedCapabilities.length > 0 && (
-                    <details className="mb-3 ml-6 text-xs">
-                      <summary className="cursor-pointer text-[#5C635D] hover:text-[#1F2421]">
-                        AI 识别到的项目能力（{metaReview.detectedCapabilities.length} 项）
-                        {metaReview.missingFromMainFeatures.length > 0 && (
-                          <span className="ml-1 text-[var(--color-error)]">
-                            · 其中 {metaReview.missingFromMainFeatures.length} 项未写入主要功能
-                          </span>
-                        )}
-                      </summary>
-                      <ul className="mt-2 space-y-1 pl-4">
-                        {metaReview.detectedCapabilities.map((cap, i) => {
-                          const missing = metaReview.missingFromMainFeatures.includes(cap);
-                          return (
-                            <li key={i} className={`list-disc ${missing ? "text-[var(--color-error)]" : "text-[#5C635D]"}`}>
-                              {cap}{missing ? "（未覆盖）" : ""}
-                            </li>
-                          );
-                        })}
-                      </ul>
-                    </details>
-                  )}
-
-                  {metaReview.issues.length === 0 ? (
-                    <p className="text-xs text-[#5C635D] pl-6">未发现明显问题。</p>
-                  ) : (
-                    <div className="space-y-2 pl-6">
-                      {metaReview.issues.map((issue, idx) => {
-                        const issueKey = `${idx}:${issue.field}`;
-                        const applied = appliedIssues[issueKey];
-                        const draft = suggestionDrafts[issueKey] ?? issue.suggestion;
-                        const isEditing = !!editingSuggestion[issueKey];
-                        const edited = draft.trim() !== issue.suggestion.trim();
-                        return (
-                          <div
-                            key={issueKey}
-                            className={`border rounded-lg p-3 text-xs ${
-                              applied
-                                ? "border-[var(--color-success)]/30 bg-[var(--color-success)]/5 opacity-60"
-                                : issue.severity === "high"
-                                ? "border-[var(--color-error)]/30 bg-[var(--color-error)]/5"
-                                : "border-[var(--color-border)] bg-[var(--color-card)]"
-                            }`}
-                          >
-                            <div className="flex items-start justify-between gap-2 mb-1">
-                              <span className="font-medium text-[#1F2421]">
-                                {issue.fieldLabel}
-                                <span className="ml-1.5 font-normal text-[10px] text-[#5C635D]">{issue.kind}</span>
-                              </span>
-                              <span
-                                className={`px-1.5 py-0.5 rounded text-[10px] ${
-                                  issue.severity === "high"
-                                    ? "bg-[var(--color-error)]/20 text-[var(--color-error)]"
-                                    : issue.severity === "low"
-                                    ? "bg-[var(--color-muted)]/20 text-[var(--color-muted)]"
-                                    : "bg-[#C4612F]/20 text-[#C4612F]"
-                                }`}
-                              >
-                                {issue.severity === "high" ? "严重" : issue.severity === "low" ? "轻微" : "中等"}
-                              </span>
-                            </div>
-                            <p className="text-[#5C635D] mb-2">问题：{issue.problem}</p>
-
-                            <div className="text-[#5C635D] mb-1">
-                              建议{edited ? "（已手动修改）" : ""}：
-                            </div>
-                            {isEditing ? (
-                              <textarea
-                                value={draft}
-                                onChange={(e) => setSuggestionDrafts((prev) => ({ ...prev, [issueKey]: e.target.value }))}
-                                rows={4}
-                                className="w-full px-2 py-1.5 mb-2 bg-[var(--color-input-bg)] border border-[var(--color-border)] rounded text-xs leading-relaxed focus:outline-none focus:border-[var(--color-primary)]"
-                              />
-                            ) : (
-                              <p className="text-[#5C635D] mb-2 whitespace-pre-wrap">{draft}</p>
-                            )}
-
-                            <div className="flex flex-wrap items-center gap-2">
-                              {!applied && (
-                                <>
-                                  <button
-                                    onClick={() => handleApplySuggestion(issueKey, issue.field, draft)}
-                                    disabled={!draft.trim()}
-                                    className="px-2 py-1 text-[10px] border border-[var(--color-border)] rounded hover:border-[var(--color-primary)] transition-colors disabled:opacity-50"
-                                  >
-                                    应用
-                                  </button>
-                                  <button
-                                    onClick={() => setEditingSuggestion((prev) => ({ ...prev, [issueKey]: !isEditing }))}
-                                    className="px-2 py-1 text-[10px] border border-[var(--color-border)] rounded text-[#5C635D] hover:border-[var(--color-muted)] transition-colors"
-                                  >
-                                    {isEditing ? "收起编辑" : "编辑建议"}
-                                  </button>
-                                  {edited && (
-                                    <button
-                                      onClick={() => setSuggestionDrafts((prev) => ({ ...prev, [issueKey]: issue.suggestion }))}
-                                      className="px-2 py-1 text-[10px] text-[#5C635D] hover:text-[#1F2421] transition-colors"
-                                    >
-                                      恢复原建议
-                                    </button>
-                                  )}
-                                </>
-                              )}
-                              {applied && (
-                                <span className="text-[10px] text-[var(--color-success)]">✓ 已应用</span>
-                              )}
-                            </div>
-                          </div>
-                        );
-                      })}
-                    </div>
-                  )}
-                </div>
-              )}
+              {/* Hidden while 编辑项目 is open — the same panel renders inside the
+                  form there, so showing both would duplicate every suggestion. */}
+              <MetaReviewPanel
+                review={editingProject ? null : metaReview}
+                appliedIssues={appliedIssues}
+                suggestionDrafts={suggestionDrafts}
+                editingSuggestion={editingSuggestion}
+                onDraftChange={(key, value) => setSuggestionDrafts((prev) => ({ ...prev, [key]: value }))}
+                onToggleEdit={(key) => setEditingSuggestion((prev) => ({ ...prev, [key]: !prev[key] }))}
+                onApply={handleApplySuggestion}
+              />
 
               <div className="grid grid-cols-2 gap-4 text-sm">
                 <MetaField label="软件分类" value={meta.category} />
@@ -1785,26 +1921,36 @@ function ProjectDetailContent() {
                     检查文档是否与项目一致、是否存在幻觉/编造、是否符合软著规范，并给出初步通过概率评估。
                   </p>
                 </div>
-                <button
-                  onClick={handleAuditManual}
-                  disabled={auditingManual || generating}
-                  className="px-3 py-1.5 text-xs border border-[var(--color-border)] rounded-lg hover:border-[var(--color-primary)] transition-colors disabled:opacity-50 flex items-center gap-1.5"
-                  title="AI 审核当前说明书质量"
-                >
-                  {auditingManual ? (
-                    <>
-                      <div className="spinner w-3 h-3 border border-[var(--color-primary)] border-t-transparent rounded-full" />
-                      审核中...
-                    </>
-                  ) : (
-                    <>
-                      <svg className="w-3.5 h-3.5" fill="none" viewBox="0 0 24 24" stroke="currentColor">
-                        <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M9 5H7a2 2 0 00-2 2v12a2 2 0 002 2h10a2 2 0 002-2V7a2 2 0 00-2-2h-2M9 5a2 2 0 002 2h2a2 2 0 002-2M9 5a2 2 0 012-2h2a2 2 0 012 2m-6 9l2 2 4-4" />
-                      </svg>
-                      审核说明书
-                    </>
-                  )}
-                </button>
+                <div className="flex items-center gap-2">
+                  <button
+                    onClick={handleDedupeManual}
+                    disabled={auditingManual || generating || reexporting}
+                    className="px-3 py-1.5 text-xs border border-[var(--color-border)] rounded-lg hover:border-[var(--color-primary)] transition-colors disabled:opacity-50"
+                    title="检查并合并文稿中重复出现的章节或小节"
+                  >
+                    清理重复章节
+                  </button>
+                  <button
+                    onClick={handleAuditManual}
+                    disabled={auditingManual || generating}
+                    className="px-3 py-1.5 text-xs border border-[var(--color-border)] rounded-lg hover:border-[var(--color-primary)] transition-colors disabled:opacity-50 flex items-center gap-1.5"
+                    title="AI 审核当前说明书质量"
+                  >
+                    {auditingManual ? (
+                      <>
+                        <div className="spinner w-3 h-3 border border-[var(--color-primary)] border-t-transparent rounded-full" />
+                        审核中...
+                      </>
+                    ) : (
+                      <>
+                        <svg className="w-3.5 h-3.5" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+                          <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M9 5H7a2 2 0 00-2 2v12a2 2 0 002 2h10a2 2 0 002-2V7a2 2 0 00-2-2h-2M9 5a2 2 0 002 2h2a2 2 0 002-2M9 5a2 2 0 012-2h2a2 2 0 012 2m-6 9l2 2 4-4" />
+                        </svg>
+                        审核说明书
+                      </>
+                    )}
+                  </button>
+                </div>
               </div>
 
               {auditError && (
@@ -2060,6 +2206,158 @@ function MetaField({ label, value }: { label: string; value: string }) {
     <div>
       <div className="text-xs text-[var(--color-muted)] mb-1">{label}</div>
       <div className="text-sm">{value || <span className="text-[var(--color-muted)]">-</span>}</div>
+    </div>
+  );
+}
+
+/**
+ * AI 核对 results with per-issue edit/apply.
+ *
+ * Extracted so the same panel can render both in the metadata card and inside
+ * 「编辑项目」 — review has to be available wherever the fields are editable.
+ */
+function MetaReviewPanel({
+  review,
+  appliedIssues,
+  suggestionDrafts,
+  editingSuggestion,
+  onDraftChange,
+  onToggleEdit,
+  onApply,
+}: {
+  review: MetaReviewResult | null;
+  appliedIssues: Record<string, boolean>;
+  suggestionDrafts: Record<string, string>;
+  editingSuggestion: Record<string, boolean>;
+  onDraftChange: (key: string, value: string) => void;
+  onToggleEdit: (key: string) => void;
+  onApply: (key: string, field: string, suggestion: string) => void;
+}) {
+  if (!review) return null;
+  return (
+    <div className="mb-4 bg-[#F2E3D6] border border-[#C4612F]/20 rounded-lg p-4">
+      <div className="flex items-start gap-2 mb-3">
+        <svg className="w-4 h-4 text-[#C4612F] flex-shrink-0 mt-0.5" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+          <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M9 12l2 2 4-4m6 2a9 9 0 11-18 0 9 9 0 0118 0z" />
+        </svg>
+        <div className="min-w-0 flex-1">
+          <div className="text-xs font-medium text-[#1F2421] mb-1">AI 核对结果</div>
+          <p className="text-xs text-[#5C635D]">{review.overallComment}</p>
+        </div>
+      </div>
+
+      {/* Capability coverage: what the repo does vs. what 主要功能 lists, so
+          omissions stay visible even when the model files no issue. */}
+      {review.detectedCapabilities.length > 0 && (
+        <details className="mb-3 ml-6 text-xs">
+          <summary className="cursor-pointer text-[#5C635D] hover:text-[#1F2421]">
+            AI 识别到的项目能力（{review.detectedCapabilities.length} 项）
+            {review.missingFromMainFeatures.length > 0 && (
+              <span className="ml-1 text-[var(--color-error)]">
+                · 其中 {review.missingFromMainFeatures.length} 项未写入主要功能
+              </span>
+            )}
+          </summary>
+          <ul className="mt-2 space-y-1 pl-4">
+            {review.detectedCapabilities.map((cap, i) => {
+              const missing = review.missingFromMainFeatures.includes(cap);
+              return (
+                <li key={i} className={`list-disc ${missing ? "text-[var(--color-error)]" : "text-[#5C635D]"}`}>
+                  {cap}{missing ? "（未覆盖）" : ""}
+                </li>
+              );
+            })}
+          </ul>
+        </details>
+      )}
+
+      {review.issues.length === 0 ? (
+        <p className="text-xs text-[#5C635D] pl-6">未发现明显问题。</p>
+      ) : (
+        <div className="space-y-2 pl-6">
+          {review.issues.map((issue, idx) => {
+            const issueKey = `${idx}:${issue.field}`;
+            const applied = appliedIssues[issueKey];
+            const draft = suggestionDrafts[issueKey] ?? issue.suggestion;
+            const isEditing = !!editingSuggestion[issueKey];
+            const edited = draft.trim() !== issue.suggestion.trim();
+            return (
+              <div
+                key={issueKey}
+                className={`border rounded-lg p-3 text-xs ${
+                  applied
+                    ? "border-[var(--color-success)]/30 bg-[var(--color-success)]/5 opacity-60"
+                    : issue.severity === "high"
+                    ? "border-[var(--color-error)]/30 bg-[var(--color-error)]/5"
+                    : "border-[var(--color-border)] bg-[var(--color-card)]"
+                }`}
+              >
+                <div className="flex items-start justify-between gap-2 mb-1">
+                  <span className="font-medium text-[#1F2421]">
+                    {issue.fieldLabel}
+                    <span className="ml-1.5 font-normal text-[10px] text-[#5C635D]">{issue.kind}</span>
+                  </span>
+                  <span
+                    className={`px-1.5 py-0.5 rounded text-[10px] ${
+                      issue.severity === "high"
+                        ? "bg-[var(--color-error)]/20 text-[var(--color-error)]"
+                        : issue.severity === "low"
+                        ? "bg-[var(--color-muted)]/20 text-[var(--color-muted)]"
+                        : "bg-[#C4612F]/20 text-[#C4612F]"
+                    }`}
+                  >
+                    {issue.severity === "high" ? "严重" : issue.severity === "low" ? "轻微" : "中等"}
+                  </span>
+                </div>
+                <p className="text-[#5C635D] mb-2">问题：{issue.problem}</p>
+
+                <div className="text-[#5C635D] mb-1">
+                  建议{edited ? "（已手动修改）" : ""}：
+                </div>
+                {isEditing ? (
+                  <textarea
+                    value={draft}
+                    onChange={(e) => onDraftChange(issueKey, e.target.value)}
+                    rows={4}
+                    className="w-full px-2 py-1.5 mb-2 bg-[var(--color-input-bg)] border border-[var(--color-border)] rounded text-xs leading-relaxed focus:outline-none focus:border-[var(--color-primary)]"
+                  />
+                ) : (
+                  <p className="text-[#5C635D] mb-2 whitespace-pre-wrap">{draft}</p>
+                )}
+
+                <div className="flex flex-wrap items-center gap-2">
+                  {!applied && (
+                    <>
+                      <button
+                        onClick={() => onApply(issueKey, issue.field, draft)}
+                        disabled={!draft.trim()}
+                        className="px-2 py-1 text-[10px] border border-[var(--color-border)] rounded hover:border-[var(--color-primary)] transition-colors disabled:opacity-50"
+                      >
+                        应用
+                      </button>
+                      <button
+                        onClick={() => onToggleEdit(issueKey)}
+                        className="px-2 py-1 text-[10px] border border-[var(--color-border)] rounded text-[#5C635D] hover:border-[var(--color-muted)] transition-colors"
+                      >
+                        {isEditing ? "收起编辑" : "编辑建议"}
+                      </button>
+                      {edited && (
+                        <button
+                          onClick={() => onDraftChange(issueKey, issue.suggestion)}
+                          className="px-2 py-1 text-[10px] text-[#5C635D] hover:text-[#1F2421] transition-colors"
+                        >
+                          恢复原建议
+                        </button>
+                      )}
+                    </>
+                  )}
+                  {applied && <span className="text-[10px] text-[var(--color-success)]">✓ 已应用</span>}
+                </div>
+              </div>
+            );
+          })}
+        </div>
+      )}
     </div>
   );
 }
