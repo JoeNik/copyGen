@@ -1,4 +1,15 @@
 import { getAIBaseUrl, getAIModel, getActiveProvider, type AIProtocol } from "@/lib/storage";
+import { getReviewRules, formatRulesForPrompt } from "@/lib/review-rules";
+
+/** User-maintained audit rules, appended to review/audit prompts. */
+function userAuditRules(): string {
+  return formatRulesForPrompt(getReviewRules().auditRules, "【用户补充的审核规则（与上述规则同等重要）】");
+}
+
+/** User-maintained writing guidance, appended to generation prompts. */
+function userWritingRules(): string {
+  return formatRulesForPrompt(getReviewRules().writingRules, "【用户补充的撰写要求（必须遵守）】");
+}
 
 interface ProviderConfig {
   protocol: AIProtocol;
@@ -508,7 +519,7 @@ export function buildMetaReviewPrompt(input: {
 - suggestion 一律给出可直接替换原值的完整最终文本，不要写“建议改为……”这类前缀，不要只给增量。
 - 若某字段确实合理、无需修改，就不要为它编造问题。
 - 若仓库中存在不适合写入软著申报材料的模块（例如命名涉及命理、占卜、风水、求签的目录），不要建议把它写进「主要功能」；如确需覆盖，请改用「民俗文化资料展示」这类中性表述。
-${SOFT_COPYRIGHT_COMPLIANCE_RULES}
+${SOFT_COPYRIGHT_COMPLIANCE_RULES}${userAuditRules()}
 
 仓库名称：${input.repoName}
 仓库描述：${input.repoDescription || "无"}
@@ -650,7 +661,7 @@ ${SOFT_COPYRIGHT_COMPLIANCE_RULES}
 - 幻觉判定要具体到“编造了什么”：编程语言、端口号、脚本/可执行文件名、精确版本号、第三方库名、硬件型号，这几类只要文档写了而下方信息中无依据，就应指出。
 - 反过来，仓库里存在但说明书没写到的目录/组件，**不一定**是问题：说明书覆盖的是本次登记的功能范围，未纳入本版本的模块可以不写。只有当缺失的模块属于登记信息「主要功能」列出的内容时，才按“完整性”提出。
 - 不要自己臆造问题；无法确定的从轻。
-- score（文档质量）与 passProbability（软著初步通过概率）都用 0–100 整数。
+- score（文档质量）与 passProbability（软著初步通过概率）都用 0–100 整数。${userAuditRules()}
 
 软件名称：${input.softwareName} ${input.version}
 编程语言：${input.languages || "未知"}
@@ -755,6 +766,8 @@ export interface LocatedSection {
   end: number;
   /** How the section was found — surfaced so the user can sanity-check it. */
   matchedBy: "exact" | "normalized" | "contains";
+  /** Other headings that matched equally well; non-empty means the anchor is ambiguous. */
+  otherCandidates: string[];
 }
 
 /**
@@ -764,6 +777,11 @@ export interface LocatedSection {
  * with numbering/punctuation/whitespace stripped, then substring containment.
  * A section runs from its heading up to the next heading of the same or higher
  * level, so rewriting it can't swallow sibling sections.
+ *
+ * When a pass matches several headings the first is returned but the rest are
+ * reported in `otherCandidates` — a loose anchor like「运行环境」can hit multiple
+ * sections, and silently rewriting the wrong one is how a revision makes the
+ * document worse instead of better.
  */
 export function locateSection(markdown: string, anchor: string): LocatedSection | null {
   const target = anchor.trim();
@@ -793,8 +811,9 @@ export function locateSection(markdown: string, anchor: string): LocatedSection 
   ];
 
   for (const pass of passes) {
-    const hit = headings.find((h) => pass.test(h.line));
-    if (!hit) continue;
+    const matches = headings.filter((h) => pass.test(h.line));
+    if (!matches.length) continue;
+    const hit = matches[0];
     // End at the next heading that is not nested inside this one.
     const next = headings.find((h) => h.index > hit.index && h.level <= hit.level);
     const endLine = next ? next.index : lines.length;
@@ -806,9 +825,75 @@ export function locateSection(markdown: string, anchor: string): LocatedSection 
       start,
       end: start + text.length,
       matchedBy: pass.by,
+      otherCandidates: matches.slice(1).map((h) => h.line.trim()),
     };
   }
   return null;
+}
+
+/** All heading lines, for a manual section picker. */
+export function listSectionHeadings(markdown: string): string[] {
+  return markdown
+    .split("\n")
+    .map((l) => l.trim())
+    .filter((l) => /^#{1,6}\s+/.test(l));
+}
+
+/**
+ * Concrete tokens an audit finding accuses the document of containing.
+ *
+ * Pulled from quoted spans and from things that look like fabricated specifics —
+ * ports, versions, file names, identifiers. These are what let us verify the
+ * located section is actually the one at fault before rewriting it.
+ */
+export function extractProblemEvidence(problem: string, suggestion = ""): string[] {
+  const out = new Set<string>();
+  const text = `${problem}\n${suggestion}`;
+
+  // Quoted spans, in any of the quote styles models use.
+  const quoted = text.matchAll(/[「『"'"'`（(]\s*([^」』"'"'`）)]{2,40}?)\s*[」』"'"'`）)]/g);
+  for (const m of quoted) {
+    const v = m[1].trim();
+    if (v && !/^[，。、；：!?…\s]+$/.test(v)) out.add(v);
+  }
+
+  // Fabricated-specific shapes: file names, versions, ports, ALLCAPS identifiers.
+  for (const m of text.matchAll(/\b[\w.-]+\.(?:exe|sh|bat|cmd|ps1|js|ts|py|jar|dll|so|conf|ya?ml|json|env)\b/gi)) {
+    out.add(m[0]);
+  }
+  for (const m of text.matchAll(/\b\d+\.\d+(?:\.\d+)+\b/g)) out.add(m[0]);
+  for (const m of text.matchAll(/\b(?:端口\s*)?([1-9]\d{3,4})\b/g)) out.add(m[1]);
+  for (const m of text.matchAll(/\b[A-Z][A-Za-z]{2,}(?:[A-Z][A-Za-z]+)+\b/g)) out.add(m[0]);
+
+  return Array.from(out).filter((s) => s.length >= 2);
+}
+
+export interface EvidenceCheck {
+  /** Evidence tokens found in the section. */
+  found: string[];
+  /** Evidence tokens the finding mentions but the section doesn't contain. */
+  missing: string[];
+  /** True when at least one token was located, or when there was nothing to check. */
+  confirmed: boolean;
+}
+
+/**
+ * Check the located section really contains what the finding complains about.
+ *
+ * A finding whose evidence appears nowhere in the section usually means the anchor
+ * pointed at the wrong place. Rewriting anyway churns correct text and drags the
+ * score down, so callers should treat `confirmed: false` as "ask the user first".
+ */
+export function verifySectionEvidence(sectionText: string, evidence: string[]): EvidenceCheck {
+  if (!evidence.length) return { found: [], missing: [], confirmed: true };
+  const haystack = sectionText.toLowerCase();
+  const found: string[] = [];
+  const missing: string[] = [];
+  for (const token of evidence) {
+    if (haystack.includes(token.toLowerCase())) found.push(token);
+    else missing.push(token);
+  }
+  return { found, missing, confirmed: found.length > 0 };
 }
 
 /** Replace a located section's text in the document. */
@@ -829,7 +914,13 @@ export function buildSectionRevisionPrompt(input: {
   sectionText: string;
   problem: string;
   suggestion: string;
+  /** Concrete tokens the finding accuses this section of containing. */
+  evidence?: string[];
 }): string {
+  const evidenceBlock = input.evidence?.length
+    ? `\n审核问题中提到的具体内容（这些才是需要处理的对象，逐个确认后再改；如果某项在原文中并不存在，就不要为它改动任何文字）：\n${input.evidence.map((e) => `- ${e}`).join("\n")}\n`
+    : "";
+
   return `你是中国软件著作权「文档鉴别材料/操作说明书」撰写专家。下面给出说明书中的**一个小节**，以及审核指出的问题。请按审核意见重写这个小节。
 
 硬性要求：
@@ -837,15 +928,19 @@ export function buildSectionRevisionPrompt(input: {
 - 不要输出其它小节，不要输出说明、前言、结语，不要用代码围栏包裹。
 - 保持原有的标题层级与编号；小节内部可以增删 ### 子标题和段落。
 - 篇幅与原文相当或略多，不要大幅缩短（软著文档鉴别材料需要足够篇幅）。
-- 只修正审核指出的问题，其余正确内容尽量保留原样，避免引入新的不一致。
 
+【最小改动原则】这一条最重要：
+- 只改审核明确指出的问题，其余内容必须逐字保留，包括段落顺序、编号、小标题、图占位、表格。
+- 不要顺手"优化"措辞、不要重排结构、不要补充审核没有要求的内容。改动越少越好。
+- 如果审核指出的问题在这段原文里其实并不存在（可能是定位偏差），就把原文**原样返回**，不要为了"有所改动"而改写。
+${evidenceBlock}
 【严禁编造具体事实】没有依据时必须改用概括表述：
 - 编程语言只能使用下面「编程语言」中列出的；不要自行添加其它语言。
 - 端口号、IP、数据库名、精确版本号：改写为「按部署环境配置的服务端口」「参见运行支撑环境要求」这类表述。
 - 安装脚本名、可执行文件名、具体命令：改写为「运行安装程序」「执行项目提供的启动命令」这类表述。
 - 第三方库名、协议名、硬件型号：同上。
 - 功能模块名必须与「主要功能」以及下面的文档大纲一致，不要另起名字。
-${SOFT_COPYRIGHT_COMPLIANCE_RULES}
+${SOFT_COPYRIGHT_COMPLIANCE_RULES}${userWritingRules()}
 
 软件名称：${input.softwareName} ${input.version}
 编程语言：${input.languages || "未知"}
@@ -881,7 +976,8 @@ export async function reviseSection(input: {
   section: LocatedSection;
   problem: string;
   suggestion: string;
-}): Promise<string> {
+  evidence?: string[];
+}): Promise<{ text: string; changed: boolean }> {
   const { text } = await callAILongWithRetry(
     [{ role: "user", content: buildSectionRevisionPrompt({ ...input, sectionText: input.section.text }) }],
     undefined,
@@ -896,7 +992,12 @@ export async function reviseSection(input: {
   if (/^#{1,6}\s+/.test(firstLine.trim())) {
     revised = revised.slice(firstLine.length).replace(/^\n+/, "");
   }
-  return sanitizeSoftCopyrightText(`${input.section.heading}\n\n${revised}`.trim());
+  const finalText = sanitizeSoftCopyrightText(`${input.section.heading}\n\n${revised}`.trim());
+  // Whitespace-insensitive comparison: the model reflowing blank lines isn't a
+  // real change, and telling the user "nothing changed" is more useful than
+  // showing a diff that's pure formatting.
+  const norm = (s: string) => s.replace(/\s+/g, " ").trim();
+  return { text: finalText, changed: norm(finalText) !== norm(input.section.text) };
 }
 
 /** Heading outline of a document, for continuity context in revision prompts. */
@@ -906,6 +1007,72 @@ export function documentOutline(markdown: string): string {
     .filter((l) => /^#{1,6}\s+/.test(l.trim()))
     .map((l) => l.trim())
     .join("\n");
+}
+
+// ── Distil a 软著 rule collection into usable prompt rules ──
+
+export interface DistilledRules {
+  /** Checkable rules for the reviewer. */
+  auditRules: string;
+  /** Guidance for the document generator. */
+  writingRules: string;
+  /** One-line note on what the source covers. */
+  summary: string;
+}
+
+export function buildRuleDistillPrompt(docs: { path: string; content: string }[]): string {
+  const body = docs
+    .map((d) => `--- ${d.path} ---\n${d.content}`)
+    .join("\n\n")
+    .slice(0, 100_000);
+
+  return `下面是一个专门收集「中国计算机软件著作权登记」经验与规则的资料库中的文档。请把其中**可操作的规则**提炼成两份清单，供一个自动生成软著申报材料的工具使用。
+
+两份清单的用途不同，请分开：
+1. auditRules —— 用于**审核**已生成的说明书。每条必须是可判定的检查项，看一份文档就能回答"符合/不符合"。
+2. writingRules —— 用于**撰写**说明书时约束 AI。每条必须是可执行的写作要求。
+
+提炼要求：
+- 每条一行，以「- 」开头，不要编号，不要嵌套。
+- 只保留资料中确实提到的规则，不要补充你自己的常识；资料没说的不要写。
+- 丢掉纯流程性内容（去哪个网站提交、要交多少钱、多久出证、快递地址等），这些与文档内容质量无关。
+- 丢掉与本工具无关的内容（例如纸质材料装订、公证、代理机构选择）。
+- 同类规则合并成一条，不要重复。
+- 具体数字（页数、行数、字数、份数要求）要保留原样，这类硬性要求最有价值。
+- 每份清单最多 25 条，优先保留会导致**驳回或补正**的硬性要求。
+- 如果资料中包含"常见驳回原因""补正通知""审查要点"这类内容，优先提炼。
+- 用中文输出。
+
+只返回如下 JSON（不要解释、不要代码围栏）：
+{
+  "summary": "这份资料主要涵盖什么内容（一句话）",
+  "auditRules": "- 规则一\\n- 规则二\\n...",
+  "writingRules": "- 要求一\\n- 要求二\\n..."
+}
+
+资料内容：
+"""
+${body}
+"""`;
+}
+
+export async function distilRulesFromDocs(
+  docs: { path: string; content: string }[]
+): Promise<DistilledRules> {
+  const text = await callAILongJSON(
+    [{ role: "user", content: buildRuleDistillPrompt(docs) }],
+    "AI 提炼规则"
+  );
+  const parsed = extractJsonObject(text);
+  if (!parsed) throw new Error("AI 未返回可解析的提炼结果，请重试");
+
+  const pick = (k: string) => (typeof parsed[k] === "string" ? String(parsed[k]).trim() : "");
+  const auditRules = pick("auditRules");
+  const writingRules = pick("writingRules");
+  if (!auditRules && !writingRules) {
+    throw new Error("AI 未能从该仓库提炼出可用规则，请确认这是软著规则资料库");
+  }
+  return { auditRules, writingRules, summary: pick("summary") };
 }
 
 export function buildAutoNamePrompt(repoName: string, description: string, language: string): string {
@@ -990,7 +1157,7 @@ export function buildMetadataPrompt(input: MetadataPromptInput): string {
 - 「开发目的」1-2 句，说明本软件面向的问题与目标，保持概括。
 - 「技术特点」2-3 句，说明总体技术方案与架构层次，不需要列举具体库名。
 - 不要编造仓库中没有依据的功能模块、平台或依赖。
-${SOFT_COPYRIGHT_COMPLIANCE_RULES}
+${SOFT_COPYRIGHT_COMPLIANCE_RULES}${userWritingRules()}
 
 ## 仓库基本信息
 名称：${input.repoName}
@@ -1561,7 +1728,7 @@ ${codeSummary.slice(0, 3000)}`;
 - 安装脚本、可执行文件名、命令（如 setup.exe、install.sh、check_env.sh、npm run seed）：没有依据时描述操作步骤本身（「运行安装程序」「执行项目提供的启动命令」），不要虚构文件名。
 - 第三方库名、协议名、硬件型号：同上，没有依据不要写。
 这些编造出来的细节是软著审核退回的主要原因，宁可概括也不要具体错。
-${SOFT_COPYRIGHT_COMPLIANCE_RULES}`;
+${SOFT_COPYRIGHT_COMPLIANCE_RULES}${userWritingRules()}`;
 
   let allText = opts.resumeMarkdown || "";
   let startChapter = opts.resumeChapterIndex ?? 0;

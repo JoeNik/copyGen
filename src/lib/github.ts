@@ -26,6 +26,8 @@ interface GitHubFile {
 
 interface GitHubTreeResponse {
   tree: GitHubFile[];
+  /** GitHub sets this when the recursive listing hit its size limit. */
+  truncated?: boolean;
 }
 
 interface GitHubContentResponse {
@@ -129,16 +131,28 @@ export async function fetchRepo(token: string, owner: string, repo: string): Pro
   return res.json();
 }
 
-async function fetchTree(
+/**
+ * Tree listing plus GitHub's `truncated` flag.
+ *
+ * The recursive trees API caps its response; past that limit GitHub silently
+ * returns a partial list. Anything counting 源程序量 has to know, otherwise a huge
+ * repo reports a confidently wrong number.
+ */
+async function fetchTreeWithFlags(
   token: string, owner: string, repo: string, branch: string
-): Promise<GitHubFile[]> {
+): Promise<{ files: GitHubFile[]; truncated: boolean; rawCount: number }> {
   const res = await fetch(
     `https://api.github.com/repos/${owner}/${repo}/git/trees/${branch}?recursive=1`,
     { headers: { Authorization: `Bearer ${token}` } }
   );
   if (!res.ok) throw new Error("获取仓库文件树失败");
   const data: GitHubTreeResponse = await res.json();
-  return data.tree.filter((f) => f.type === "blob" && !shouldIgnore(f.path));
+  const blobs = data.tree.filter((f) => f.type === "blob");
+  return {
+    files: blobs.filter((f) => !shouldIgnore(f.path)),
+    truncated: !!data.truncated,
+    rawCount: blobs.length,
+  };
 }
 
 async function fetchContent(
@@ -248,9 +262,18 @@ export async function fetchRepoFiles(
   codeFileCount: number;
   /** Countable files whose lines were estimated rather than read. */
   estimatedFileCount: number;
+  /** Per-extension breakdown of the total, so the figure can be sanity-checked. */
+  linesByExtension: { ext: string; files: number; lines: number }[];
+  /** GitHub truncated the tree listing — the total is a floor, not the real size. */
+  treeTruncated: boolean;
+  /** Bytes-per-line ratio used for the estimated files. */
+  bytesPerLine: number;
 }> {
   onProgress?.("正在读取仓库文件列表...", 5);
-  const fullTree = await fetchTree(token, owner, repo, branch);
+  const { files: fullTree, truncated } = await fetchTreeWithFlags(token, owner, repo, branch);
+  if (truncated) {
+    onProgress?.("注意：仓库文件过多，GitHub 只返回了部分文件树，源程序量会偏小", 5);
+  }
 
   // Compute extension ratios from full tree (for AI and UI)
   const extCounts: Record<string, number> = {};
@@ -276,11 +299,22 @@ export async function fetchRepoFiles(
   const filteredTree = filterByLanguageRatio(fullTree);
   const filesToRead = filteredTree.slice(0, MAX_FILES);
   const total = filesToRead.length;
+  /** Raw line counts for files we read, so counting never re-derives them. */
+  const rawLinesByPath = new Map<string, number>();
 
   const files: { path: string; content: string }[] = [];
   const readPaths = new Set<string>();
   let totalChars = 0;
-  let readLines = 0;
+  /**
+   * Lines of the ORIGINAL file, not the comment-stripped copy.
+   *
+   * 源程序量 means the size of the source code; comment stripping exists only to
+   * fit more of the program into the PDF appendix. Counting stripped lines both
+   * under-reported the total and skewed the bytes-per-line ratio below (blob sizes
+   * are raw bytes, so dividing them by stripped lines inflated bytes/line and
+   * therefore shrank every estimate).
+   */
+  let readRawLines = 0;
   let failedReads = 0;
   let stopped = false;
 
@@ -293,14 +327,15 @@ export async function fetchRepoFiles(
         const { content: raw, ok } = await fetchContent(token, owner, repo, f.path);
         // Strip comments and sanitize
         const cleaned = stripComments(sanitizeCode(raw), f.path);
-        return { path: f.path, content: cleaned, ok };
+        return { path: f.path, content: cleaned, rawLines: countLines(raw), ok };
       })
     );
     for (const r of results) {
       if (!r.ok) failedReads++;
       files.push({ path: r.path, content: r.content });
       readPaths.add(r.path);
-      readLines += countLines(r.content);
+      readRawLines += r.rawLines;
+      rawLinesByPath.set(r.path, r.rawLines);
       totalChars += r.content.length;
       if (totalChars >= MAX_TOTAL_CHARS) {
         stopped = true;
@@ -321,31 +356,47 @@ export async function fetchRepoFiles(
   const countableFiles = selectCountableCodeFiles(fullTree);
 
   // Calibrate bytes-per-line against the files we actually read, then apply that
-  // ratio to everything we didn't. ~34 bytes/line is the fallback for typical
-  // source once comments are stripped.
-  let bytesPerLine = 34;
+  // ratio to everything we didn't. Both sides are raw: blob size ÷ raw line count.
+  // The 36 fallback only applies when nothing could be sampled; measured across
+  // real sources it ranges ~30 (plain JS/config-heavy) to ~50 (JSX with long
+  // class attributes), so a measured ratio always beats it.
+  let bytesPerLine = 36;
   const readBytes = filesToRead
     .filter((f) => readPaths.has(f.path))
     .reduce((sum, f) => sum + (f.size || 0), 0);
-  if (readLines > 0 && readBytes > 0) {
-    const observed = readBytes / readLines;
+  if (readRawLines > 0 && readBytes > 0) {
+    const observed = readBytes / readRawLines;
     if (observed >= 8 && observed <= 200) bytesPerLine = observed;
   }
 
   let countedLines = 0;
   let estimatedFileCount = 0;
+  // Per-extension breakdown so the reported total is auditable rather than a
+  // single opaque number.
+  const byExt = new Map<string, { files: number; lines: number }>();
+  const bump = (path: string, lines: number) => {
+    const ext = getExt(path) || "(无扩展名)";
+    const cur = byExt.get(ext) || { files: 0, lines: 0 };
+    cur.files++;
+    cur.lines += lines;
+    byExt.set(ext, cur);
+  };
   for (const f of countableFiles) {
-    if (readPaths.has(f.path)) continue;
-    countedLines += Math.round((f.size || 0) / bytesPerLine);
+    const known = rawLinesByPath.get(f.path);
+    if (known != null) {
+      countedLines += known;
+      bump(f.path, known);
+      continue;
+    }
+    const est = Math.round((f.size || 0) / bytesPerLine);
+    countedLines += est;
     estimatedFileCount++;
+    bump(f.path, est);
   }
-  // Read files contribute their real line counts, but only those that are also
-  // countable — `filteredTree` and `countableFiles` are near-identical in practice,
-  // yet double-counting or omitting would both skew the total.
-  const countablePaths = new Set(countableFiles.map((f) => f.path));
-  for (const f of files) {
-    if (countablePaths.has(f.path)) countedLines += countLines(f.content);
-  }
+
+  const linesByExtension = Array.from(byExt.entries())
+    .map(([ext, v]) => ({ ext, files: v.files, lines: v.lines }))
+    .sort((a, b) => b.lines - a.lines);
 
   if (failedReads > 0) {
     onProgress?.(`有 ${failedReads} 个文件读取失败，已跳过其内容`, 25);
@@ -361,6 +412,9 @@ export async function fetchRepoFiles(
     readFileCount: files.length,
     codeFileCount: countableFiles.length,
     estimatedFileCount,
+    linesByExtension,
+    treeTruncated: truncated,
+    bytesPerLine: Math.round(bytesPerLine * 10) / 10,
   };
 }
 
@@ -396,6 +450,86 @@ const INSIGHT_FILES = [
   "go.mod", "pom.xml", "build.gradle", "composer.json", "Gemfile",
   "docker-compose.yml", "Dockerfile",
 ];
+
+/**
+ * Read the prose out of a documentation repository.
+ *
+ * Used for importing 软著 rule collections: those repos are mostly Markdown, and
+ * what matters is the text, not the structure. Reads the largest Markdown files
+ * (README first) up to a character budget, since a rules repo's substance is
+ * usually concentrated in a few long documents.
+ */
+export async function fetchRepoMarkdown(
+  token: string,
+  owner: string,
+  repo: string,
+  branch: string,
+  opts?: { maxChars?: number; maxFiles?: number; onProgress?: (msg: string) => void }
+): Promise<{ docs: { path: string; content: string }[]; totalChars: number; skipped: number }> {
+  const maxChars = opts?.maxChars ?? 120_000;
+  const maxFiles = opts?.maxFiles ?? 25;
+  opts?.onProgress?.("正在读取仓库文件树...");
+
+  const res = await fetch(
+    `https://api.github.com/repos/${owner}/${repo}/git/trees/${branch}?recursive=1`,
+    { headers: { Authorization: `Bearer ${token}` } }
+  );
+  if (!res.ok) throw new Error("获取仓库文件树失败，请确认仓库地址和分支");
+  const data: GitHubTreeResponse = await res.json();
+
+  const mdFiles = data.tree
+    .filter((f) => f.type === "blob" && /\.(md|markdown|txt|rst)$/i.test(f.path))
+    .filter((f) => {
+      const parts = f.path.split("/");
+      return !parts.slice(0, -1).some((d) => IGNORED_DIRS.has(d));
+    })
+    .sort((a, b) => {
+      // README first, then by size — the substance tends to be in long documents.
+      const aRoot = /^readme\./i.test(a.path) ? 1 : 0;
+      const bRoot = /^readme\./i.test(b.path) ? 1 : 0;
+      if (aRoot !== bRoot) return bRoot - aRoot;
+      return (b.size || 0) - (a.size || 0);
+    });
+
+  if (mdFiles.length === 0) throw new Error("该仓库中没有找到 Markdown/文本文档");
+
+  const docs: { path: string; content: string }[] = [];
+  let totalChars = 0;
+  let skipped = 0;
+  for (const f of mdFiles) {
+    if (docs.length >= maxFiles || totalChars >= maxChars) {
+      skipped++;
+      continue;
+    }
+    opts?.onProgress?.(`正在读取 ${f.path} (${docs.length + 1}/${Math.min(mdFiles.length, maxFiles)})...`);
+    const { content, ok } = await fetchContent(token, owner, repo, f.path);
+    if (!ok || !content.trim()) {
+      skipped++;
+      continue;
+    }
+    const room = maxChars - totalChars;
+    const slice = content.length > room ? content.slice(0, room) : content;
+    docs.push({ path: f.path, content: slice });
+    totalChars += slice.length;
+  }
+
+  if (docs.length === 0) throw new Error("未能读取到任何文档内容");
+  return { docs, totalChars, skipped };
+}
+
+/** Parse `owner/repo`, a full GitHub URL, or a URL with `/tree/<branch>`. */
+export function parseRepoRef(input: string): { owner: string; repo: string; branch?: string } | null {
+  const text = input.trim().replace(/\.git$/, "");
+  if (!text) return null;
+
+  const urlMatch = /(?:https?:\/\/)?(?:www\.)?github\.com\/([^/\s]+)\/([^/\s]+)(?:\/tree\/([^/\s]+))?/i.exec(text);
+  if (urlMatch) {
+    return { owner: urlMatch[1], repo: urlMatch[2], branch: urlMatch[3] };
+  }
+  const shortMatch = /^([\w.-]+)\/([\w.-]+)$/.exec(text);
+  if (shortMatch) return { owner: shortMatch[1], repo: shortMatch[2] };
+  return null;
+}
 
 export interface RepoInsights {
   /** README text (truncated) — richest source of purpose/features */
@@ -506,8 +640,10 @@ export async function fetchRepoStats(
   // Estimate lines from code files only — counting every blob (JSON fixtures,
   // lock files, SVGs) inflates 源程序量. Same file selection as the full run so
   // the pre-generation figure and the final registered figure don't disagree.
+  // 36 bytes/line is a rough average for raw source; the full run and the
+  // 「重新估算」 button both replace it with a per-extension measured ratio.
   const codeBytes = selectCountableCodeFiles(tree).reduce((sum, f) => sum + (f.size || 0), 0);
-  const estimatedLines = Math.round(codeBytes / 34);
+  const estimatedLines = Math.round(codeBytes / 36);
 
   return { allFilePaths, languages, estimatedLines, totalTreeSize: tree.length };
 }
@@ -515,11 +651,11 @@ export async function fetchRepoStats(
 /**
  * Re-estimate 源程序量 without doing a full generation run.
  *
- * The cheap path (`fetchRepoStats`) divides total code bytes by a fixed 34
- * bytes/line, which is off by a lot for languages that differ from that average.
- * Here we sample real files spread across the repo, measure this project's own
- * bytes-per-line after comment stripping, and apply that ratio to every code
- * file. Sampling keeps it to ~25 content requests instead of hundreds.
+ * Samples real files spread across the repo, measures this project's own
+ * bytes-per-line, and applies that ratio to every code file. Sampling keeps it to
+ * ~40 content requests instead of hundreds. Lines are counted on the ORIGINAL
+ * file: 源程序量 is the size of the source, and blob sizes on the other side of
+ * the ratio are raw bytes, so stripping comments on one side only would skew it.
  */
 export async function estimateRepoSourceLines(
   token: string,
@@ -532,26 +668,52 @@ export async function estimateRepoSourceLines(
   codeFileCount: number;
   sampledFileCount: number;
   bytesPerLine: number;
+  /** Per-extension breakdown, largest first. */
+  linesByExtension: { ext: string; files: number; lines: number }[];
+  /** GitHub truncated the tree listing — the figure is a floor. */
+  treeTruncated: boolean;
 }> {
   onProgress?.("正在读取仓库文件树...");
-  const fullTree = await fetchTree(token, owner, repo, branch);
+  const { files: fullTree, truncated } = await fetchTreeWithFlags(token, owner, repo, branch);
   const codeFiles = selectCountableCodeFiles(fullTree);
   if (codeFiles.length === 0) {
-    return { sourceLines: 0, codeFileCount: 0, sampledFileCount: 0, bytesPerLine: 34 };
+    return {
+      sourceLines: 0, codeFileCount: 0, sampledFileCount: 0, bytesPerLine: 36,
+      linesByExtension: [], treeTruncated: truncated,
+    };
   }
 
-  // Spread the sample across the whole list so one directory of oddly formatted
-  // files can't dominate the ratio.
-  const SAMPLE_SIZE = 25;
-  const step = Math.max(1, Math.floor(codeFiles.length / SAMPLE_SIZE));
+  // Sample per extension rather than across the flat list: one global ratio
+  // applied to a polyglot repo is wrong for every language but the average, and
+  // extensions differ a lot (a .java line is far longer than a .py line).
+  const byExt = new Map<string, GitHubFile[]>();
+  for (const f of codeFiles) {
+    const ext = getExt(f.path) || "(无扩展名)";
+    const list = byExt.get(ext);
+    if (list) list.push(f);
+    else byExt.set(ext, [f]);
+  }
+
+  const PER_EXT_SAMPLE = 5;
+  const MAX_SAMPLE = 40;
   const sample: GitHubFile[] = [];
-  for (let i = 0; i < codeFiles.length && sample.length < SAMPLE_SIZE; i += step) {
-    sample.push(codeFiles[i]);
+  // Bigger extension groups first, so the request budget goes where it matters.
+  const extsBySize = Array.from(byExt.entries()).sort(
+    (a, b) =>
+      b[1].reduce((s, f) => s + (f.size || 0), 0) - a[1].reduce((s, f) => s + (f.size || 0), 0)
+  );
+  for (const [, list] of extsBySize) {
+    if (sample.length >= MAX_SAMPLE) break;
+    const step = Math.max(1, Math.floor(list.length / PER_EXT_SAMPLE));
+    let taken = 0;
+    for (let i = 0; i < list.length && taken < PER_EXT_SAMPLE && sample.length < MAX_SAMPLE; i += step) {
+      sample.push(list[i]);
+      taken++;
+    }
   }
 
   onProgress?.(`正在抽样 ${sample.length} 个文件以校准行数...`);
-  let sampledBytes = 0;
-  let sampledLines = 0;
+  const perExt = new Map<string, { bytes: number; lines: number; ok: number }>();
   let sampledOk = 0;
   const BATCH = 10;
   for (let i = 0; i < sample.length; i += BATCH) {
@@ -559,28 +721,56 @@ export async function estimateRepoSourceLines(
     const results = await Promise.all(
       batch.map(async (f) => {
         const { content, ok } = await fetchContent(token, owner, repo, f.path);
-        return { size: f.size || 0, lines: countLines(stripComments(content, f.path)), ok };
+        return {
+          ext: getExt(f.path) || "(无扩展名)",
+          size: f.size || 0,
+          lines: countLines(content),
+          ok,
+        };
       })
     );
     for (const r of results) {
       if (!r.ok || r.lines === 0) continue;
       sampledOk++;
-      sampledBytes += r.size;
-      sampledLines += r.lines;
+      const cur = perExt.get(r.ext) || { bytes: 0, lines: 0, ok: 0 };
+      cur.bytes += r.size;
+      cur.lines += r.lines;
+      cur.ok++;
+      perExt.set(r.ext, cur);
     }
   }
 
-  let bytesPerLine = 34;
-  if (sampledLines > 0 && sampledBytes > 0) {
-    const observed = sampledBytes / sampledLines;
-    if (observed >= 8 && observed <= 200) bytesPerLine = observed;
+  // Global fallback ratio for extensions we couldn't sample.
+  const allBytes = Array.from(perExt.values()).reduce((s, v) => s + v.bytes, 0);
+  const allLines = Array.from(perExt.values()).reduce((s, v) => s + v.lines, 0);
+  let globalRatio = 36;
+  if (allLines > 0 && allBytes > 0) {
+    const observed = allBytes / allLines;
+    if (observed >= 8 && observed <= 200) globalRatio = observed;
   }
 
-  const totalBytes = codeFiles.reduce((sum, f) => sum + (f.size || 0), 0);
+  let sourceLines = 0;
+  const linesByExtension: { ext: string; files: number; lines: number }[] = [];
+  for (const [ext, list] of byExt.entries()) {
+    const s = perExt.get(ext);
+    let ratio = globalRatio;
+    if (s && s.lines > 0 && s.bytes > 0) {
+      const observed = s.bytes / s.lines;
+      if (observed >= 8 && observed <= 200) ratio = observed;
+    }
+    const bytes = list.reduce((sum, f) => sum + (f.size || 0), 0);
+    const lines = Math.round(bytes / ratio);
+    sourceLines += lines;
+    linesByExtension.push({ ext, files: list.length, lines });
+  }
+  linesByExtension.sort((a, b) => b.lines - a.lines);
+
   return {
-    sourceLines: Math.round(totalBytes / bytesPerLine),
+    sourceLines,
     codeFileCount: codeFiles.length,
     sampledFileCount: sampledOk,
-    bytesPerLine: Math.round(bytesPerLine * 10) / 10,
+    bytesPerLine: Math.round(globalRatio * 10) / 10,
+    linesByExtension,
+    treeTruncated: truncated,
   };
 }

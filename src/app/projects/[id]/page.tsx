@@ -1,6 +1,7 @@
 "use client";
 import Logo from "@/components/Logo";
 import ConfirmDialog from "@/components/ConfirmDialog";
+import ReviewRulesModal from "@/components/ReviewRulesModal";
 import ErrorBoundary from "@/components/ErrorBoundary";
 import VersionBadge from "@/components/VersionBadge";
 
@@ -8,11 +9,11 @@ import VersionBadge from "@/components/VersionBadge";
 import { useSession } from "next-auth/react";
 import { SessionProvider } from "next-auth/react";
 import { useRouter, useParams } from "next/navigation";
-import { useEffect, useState, useCallback } from "react";
+import { useEffect, useState, useCallback, useMemo } from "react";
 import Link from "next/link";
 import { getProject, updateProject, getAIKey, getManualDraft, saveManualDraft, clearManualDraft, type Project, type SoftwareMeta, type ManualDraft } from "@/lib/storage";
 import { fetchRepoBranches, fetchRepoFiles, fetchRepoStats, fetchRepoLanguages, fetchRepoInsights, fetchRepo, estimateRepoSourceLines, type GitHubBranch } from "@/lib/github";
-import { generateManualMarkdown, callAIForText, generateProjectMetadata, sanitizeSoftCopyrightText, reviewProjectMeta, auditManualMarkdown, buildTechCategoriesFromInsightsPrompt, summarizeRepoDescription, locateSection, replaceSection, reviseSection, documentOutline, countDocumentLines, type MetaReviewResult, type ManualAuditResult } from "@/lib/ai-helpers";
+import { generateManualMarkdown, callAIForText, generateProjectMetadata, sanitizeSoftCopyrightText, reviewProjectMeta, auditManualMarkdown, buildTechCategoriesFromInsightsPrompt, summarizeRepoDescription, locateSection, replaceSection, reviseSection, documentOutline, countDocumentLines, listSectionHeadings, extractProblemEvidence, verifySectionEvidence, type MetaReviewResult, type ManualAuditResult } from "@/lib/ai-helpers";
 import { generateCodePDF } from "@/lib/docgen/code-pdf";
 import { generateManualPDF } from "@/lib/docgen/manual-pdf";
 import { parseUserAgent, detectDevTools, mapLinguistToGivenLanguages, describeLanguageStats, GIVEN_LANGUAGES, GIVEN_TECH_CATEGORIES, SOFTWARE_CATEGORIES } from "@/lib/utils";
@@ -135,6 +136,8 @@ function ProjectDetailContent() {
   const [summarizingRepoDesc, setSummarizingRepoDesc] = useState(false);
   const [recountingLines, setRecountingLines] = useState(false);
   const [recountNote, setRecountNote] = useState("");
+  /** Per-extension line breakdown from the last recount, so the total is auditable. */
+  const [lineBreakdown, setLineBreakdown] = useState<{ ext: string; files: number; lines: number }[]>([]);
 
   // AI 核对项目信息 / 审核说明书
   const [metaReview, setMetaReview] = useState<MetaReviewResult | null>(null);
@@ -151,9 +154,21 @@ function ProjectDetailContent() {
   const [revisingFinding, setRevisingFinding] = useState<number | null>(null);
   /** Staged section rewrites, keyed by finding index — reviewed before applying. */
   const [revisionDrafts, setRevisionDrafts] = useState<
-    Record<number, { heading: string; before: string; after: string; matchedBy: string }>
+    Record<number, {
+      heading: string;
+      before: string;
+      after: string;
+      matchedBy: string;
+      evidenceFound: string[];
+      evidenceMissing: string[];
+      ambiguous: string[];
+      changed: boolean;
+    }>
   >({});
   const [appliedRevisions, setAppliedRevisions] = useState<Record<number, boolean>>({});
+  /** User-chosen section heading, when the audit's anchor pointed at the wrong place. */
+  const [anchorOverrides, setAnchorOverrides] = useState<Record<number, string>>({});
+  const [showRules, setShowRules] = useState(false);
 
   /** Pending action awaiting二次确认 (guards misclicks during/after generation). */
   const [pendingConfirm, setPendingConfirm] = useState<{
@@ -165,6 +180,12 @@ function ProjectDetailContent() {
   } | null>(null);
 
   const accessToken = (session as { accessToken?: string })?.accessToken;
+
+  /** Heading list of the current draft, for the manual section picker. */
+  const manualHeadings = useMemo(
+    () => listSectionHeadings(manualMarkdown || project?.manualMarkdown || ""),
+    [manualMarkdown, project?.manualMarkdown]
+  );
 
   useEffect(() => {
     if (status === "unauthenticated") router.push("/");
@@ -797,9 +818,10 @@ function ProjectDetailContent() {
   /**
    * Re-estimate 源程序量 without a full regeneration.
    *
-   * Samples real files to calibrate bytes-per-line for this repo, then applies the
-   * ratio to every code file — the cheap tree-only estimate uses a fixed 34
-   * bytes/line and can be off by a wide margin.
+   * Samples files per extension to measure this repo's own bytes-per-line, then
+   * applies each ratio to that extension's files. Per-extension matters on
+   * polyglot repos: a .java line is far longer than a .py line, so one global
+   * ratio is wrong for every language but the average.
    */
   const handleRecountSourceLines = async () => {
     if (!project || !accessToken) return;
@@ -809,6 +831,7 @@ function ProjectDetailContent() {
     }
     setRecountingLines(true);
     setRecountNote("");
+    setLineBreakdown([]);
     setError("");
     try {
       const branch = editingProject ? projectDraft.branch.trim() || project.defaultBranch : project.defaultBranch;
@@ -830,8 +853,10 @@ function ProjectDetailContent() {
         updateProject(projectId, { meta: next });
         setProject(getProject(projectId)!);
       }
+      setLineBreakdown(result.linesByExtension);
       setRecountNote(
-        `已重新估算：${result.sourceLines} 行（代码文件 ${result.codeFileCount} 个，抽样 ${result.sampledFileCount} 个校准，约 ${result.bytesPerLine} 字节/行）`
+        `已重新估算：${result.sourceLines} 行（代码文件 ${result.codeFileCount} 个，抽样 ${result.sampledFileCount} 个按扩展名分别校准）` +
+        (result.treeTruncated ? "；注意：仓库文件过多，GitHub 只返回了部分文件树，实际行数可能更高" : "")
       );
     } catch (e) {
       setRecountNote("");
@@ -1184,6 +1209,7 @@ function ProjectDetailContent() {
       // A fresh audit invalidates staged rewrites from the previous one.
       setRevisionDrafts({});
       setAppliedRevisions({});
+      setAnchorOverrides({});
     } catch (e) {
       setAuditError(e instanceof Error ? e.message : "审核失败，请重试");
     } finally {
@@ -1194,14 +1220,15 @@ function ProjectDetailContent() {
   /**
    * Rewrite the one section an audit finding points at.
    *
-   * The finding carries an `anchor` (the section's heading line as it appears in
-   * the document); we locate that section, send only it to the AI along with the
-   * problem and the document's heading outline, and splice the result back in
-   * place. Scoping the rewrite to one section is what keeps the rest of the
-   * document byte-identical — a whole-document rewrite would churn text the audit
-   * already passed.
+   * Two guards before anything is sent to the AI, because a mislocated rewrite
+   * churns correct text and drives the score down:
+   *  1. the section is located from the finding's `anchor` (or a heading the user
+   *     picked by hand), and
+   *  2. the concrete tokens the finding complains about (quoted spans, ports,
+   *     versions, file names) must actually appear in that section.
+   * When (2) fails the user is asked to confirm before proceeding.
    */
-  const handleReviseFinding = async (idx: number) => {
+  const handleReviseFinding = async (idx: number, opts?: { skipEvidenceCheck?: boolean }) => {
     if (!project || !meta || !manualAudit) return;
     const finding = manualAudit.findings[idx];
     if (!finding) return;
@@ -1211,18 +1238,38 @@ function ProjectDetailContent() {
       return;
     }
 
-    const section = locateSection(md, finding.anchor || finding.location);
+    const anchor = anchorOverrides[idx] || finding.anchor || finding.location;
+    const section = locateSection(md, anchor);
     if (!section) {
       setAuditError(
-        `无法在文稿中定位「${finding.anchor || finding.location || "该问题"}」，请手动修改，或重新审核以获取准确定位。`
+        `无法在文稿中定位「${anchor || "该问题"}」。请在下方「手动指定段落」中选择要修订的小节，或直接在「编辑文稿」里手改。`
       );
+      return;
+    }
+
+    const evidence = extractProblemEvidence(finding.problem, finding.suggestion);
+    const check = verifySectionEvidence(section.text, evidence);
+
+    // Evidence points elsewhere → most likely the anchor is wrong. Ask instead of
+    // rewriting a section that may be perfectly fine.
+    if (!opts?.skipEvidenceCheck && !check.confirmed) {
+      requestConfirm({
+        title: "定位可能不准确，仍要修订吗？",
+        message:
+          `审核提到的内容（${check.missing.slice(0, 5).join("、")}）在「${section.heading}」中没有找到，` +
+          `这一段可能不是问题所在。强行修订可能改坏本来正确的内容，导致评分下降。\n\n` +
+          `建议先在「手动指定段落」里选对小节，或跳过这条改用手工修改。`,
+        confirmLabel: "仍然修订这一段",
+        destructive: true,
+        run: () => void handleReviseFinding(idx, { skipEvidenceCheck: true }),
+      });
       return;
     }
 
     setRevisingFinding(idx);
     setAuditError("");
     try {
-      const revised = await reviseSection({
+      const { text: revised, changed } = await reviseSection({
         softwareName: project.softwareName,
         version: project.version,
         meta: meta as unknown as Record<string, unknown>,
@@ -1232,11 +1279,21 @@ function ProjectDetailContent() {
         section,
         problem: finding.problem,
         suggestion: finding.suggestion,
+        evidence,
       });
       // Stage rather than apply: the user compares before/after and decides.
       setRevisionDrafts((prev) => ({
         ...prev,
-        [idx]: { heading: section.heading, before: section.text, after: revised, matchedBy: section.matchedBy },
+        [idx]: {
+          heading: section.heading,
+          before: section.text,
+          after: revised,
+          matchedBy: section.matchedBy,
+          evidenceFound: check.found,
+          evidenceMissing: check.missing,
+          ambiguous: section.otherCandidates,
+          changed,
+        },
       }));
     } catch (e) {
       setAuditError(e instanceof Error ? e.message : "AI 修订失败，请重试");
@@ -1586,6 +1643,21 @@ function ProjectDetailContent() {
                         />
                         {recountNote && (
                           <p className="text-xs text-[var(--color-muted)] mt-1">{recountNote}</p>
+                        )}
+                        {lineBreakdown.length > 0 && (
+                          <details className="mt-1 text-xs">
+                            <summary className="cursor-pointer text-[var(--color-muted)] hover:text-[var(--color-foreground)]">
+                              按语言查看构成（{lineBreakdown.length} 种）
+                            </summary>
+                            <ul className="mt-1 space-y-0.5 pl-2">
+                              {lineBreakdown.slice(0, 15).map((r) => (
+                                <li key={r.ext} className="flex justify-between text-[var(--color-muted)]">
+                                  <span className="font-mono">{r.ext}</span>
+                                  <span>{r.lines.toLocaleString("zh-CN")} 行 / {r.files} 个文件</span>
+                                </li>
+                              ))}
+                            </ul>
+                          </details>
                         )}
                       </div>
                     </div>
@@ -1977,6 +2049,13 @@ function ProjectDetailContent() {
                 </div>
                 <div className="flex items-center gap-2">
                   <button
+                    onClick={() => setShowRules(true)}
+                    className="px-3 py-1.5 text-xs border border-[var(--color-border)] rounded-lg hover:border-[var(--color-primary)] transition-colors"
+                    title="查看/编辑审核规则，或从规则仓库导入"
+                  >
+                    审核规则
+                  </button>
+                  <button
                     onClick={handleAuditManual}
                     disabled={auditingManual || generating}
                     className="px-3 py-1.5 text-xs border border-[var(--color-border)] rounded-lg hover:border-[var(--color-primary)] transition-colors disabled:opacity-50 flex items-center gap-1.5"
@@ -2095,6 +2174,26 @@ function ProjectDetailContent() {
                               <p className="text-[#5C635D] mb-1">问题：{finding.problem}</p>
                               <p className="text-[#5C635D] mb-2">建议：{finding.suggestion}</p>
 
+                              {!applied && (
+                                <div className="mb-2">
+                                  <label className="block text-[10px] text-[#5C635D] mb-1">
+                                    手动指定段落（定位不准时使用）
+                                  </label>
+                                  <select
+                                    value={anchorOverrides[idx] || ""}
+                                    onChange={(e) =>
+                                      setAnchorOverrides((prev) => ({ ...prev, [idx]: e.target.value }))
+                                    }
+                                    className="w-full px-2 py-1 bg-[var(--color-input-bg)] border border-[var(--color-border)] rounded text-[10px] focus:outline-none focus:border-[var(--color-primary)]"
+                                  >
+                                    <option value="">按审核给出的定位（{finding.anchor || finding.location || "未提供"}）</option>
+                                    {manualHeadings.map((h) => (
+                                      <option key={h} value={h}>{h}</option>
+                                    ))}
+                                  </select>
+                                </div>
+                              )}
+
                               {!draft && !applied && (
                                 <button
                                   onClick={() => handleReviseFinding(idx)}
@@ -2114,15 +2213,35 @@ function ProjectDetailContent() {
 
                               {draft && (
                                 <div className="mt-2 space-y-2 border-t border-[var(--color-border)] pt-2">
-                                  <div className="flex items-center justify-between gap-2">
-                                    <span className="text-[10px] text-[#5C635D]">
+                                  <div className="space-y-1">
+                                    <div className="text-[10px] text-[#5C635D]">
                                       定位到「{draft.heading}」
                                       {draft.matchedBy !== "exact" && (
-                                        <span className="text-[var(--color-error)] ml-1">
-                                          （模糊匹配，请确认段落是否正确）
-                                        </span>
+                                        <span className="text-[#C4612F] ml-1">（模糊匹配）</span>
                                       )}
-                                    </span>
+                                    </div>
+                                    {/* Whether the finding's own words appear here decides
+                                        if this rewrite is trustworthy. */}
+                                    {draft.evidenceFound.length > 0 && (
+                                      <div className="text-[10px] text-[var(--color-success)]">
+                                        ✓ 已在该段落中找到：{draft.evidenceFound.slice(0, 6).join("、")}
+                                      </div>
+                                    )}
+                                    {draft.evidenceMissing.length > 0 && (
+                                      <div className="text-[10px] text-[var(--color-error)]">
+                                        ⚠ 审核提到但该段落中未找到：{draft.evidenceMissing.slice(0, 6).join("、")}
+                                      </div>
+                                    )}
+                                    {draft.ambiguous.length > 0 && (
+                                      <div className="text-[10px] text-[#C4612F]">
+                                        ⚠ 还有 {draft.ambiguous.length} 个小节标题同样匹配（{draft.ambiguous.slice(0, 3).join("、")}），如改错请用上方下拉框指定
+                                      </div>
+                                    )}
+                                    {!draft.changed && (
+                                      <div className="text-[10px] text-[#C4612F]">
+                                        AI 认为该段落无需改动，返回了原文（说明这条问题可能定位有误）
+                                      </div>
+                                    )}
                                   </div>
                                   <details className="text-[10px]">
                                     <summary className="cursor-pointer text-[#5C635D] hover:text-[#1F2421]">
@@ -2331,6 +2450,10 @@ function ProjectDetailContent() {
           </div>
         )}
       </main>
+
+      {showRules && (
+        <ReviewRulesModal accessToken={accessToken} onClose={() => setShowRules(false)} />
+      )}
 
       {pendingConfirm && (
         <ConfirmDialog

@@ -10,6 +10,7 @@ import { useRouter } from "next/navigation";
 import { useEffect, useState, useMemo } from "react";
 import { getProjects, getAIKey, getActiveProvider, deleteProject, deleteProjects, type Project } from "@/lib/storage";
 import AISettingsModal from "@/components/AISettingsModal";
+import ReviewRulesModal from "@/components/ReviewRulesModal";
 import ErrorBoundary from "@/components/ErrorBoundary";
 import VersionBadge from "@/components/VersionBadge";
 
@@ -39,7 +40,10 @@ function DashboardContent() {
   const [search, setSearch] = useState("");
   const [confirmDelete, setConfirmDelete] = useState<string | null>(null);
   const [showSettings, setShowSettings] = useState(false);
+  const [showRules, setShowRules] = useState(false);
   const [activeLabel, setActiveLabel] = useState(() => getActiveProvider()?.label || "");
+
+  const accessToken = (session as { accessToken?: string })?.accessToken;
 
   useEffect(() => {
     if (status === "unauthenticated") router.push("/");
@@ -128,6 +132,13 @@ function DashboardContent() {
             <VersionBadge />
           </div>
           <div className="flex items-center gap-4">
+            <button
+              onClick={() => setShowRules(true)}
+              className="text-sm text-[var(--color-muted)] hover:text-[var(--color-foreground)] transition-colors"
+              title="软著审核规则：可手动编辑，也可从规则仓库导入"
+            >
+              审核规则
+            </button>
             <button
               onClick={() => setShowSettings(true)}
               className="text-sm text-[var(--color-muted)] hover:text-[var(--color-foreground)] transition-colors"
@@ -253,6 +264,10 @@ function DashboardContent() {
           </div>
         )}
       </main>
+
+      {showRules && (
+        <ReviewRulesModal accessToken={accessToken} onClose={() => setShowRules(false)} />
+      )}
 
       {showSettings && (
         <AISettingsModal

@@ -11,6 +11,35 @@ export interface ChangelogEntry {
 
 export const CHANGELOG: ChangelogEntry[] = [
   {
+    "hash": "e45932b",
+    "date": "2026-07-31",
+    "subject": "feat: per-finding AI revision; fix 源程序量 undercount",
+    "details": [
+      "Replace 清理重复章节 with targeted section revision. Audit findings now carry an",
+      "`anchor` — the verbatim heading line of the offending section — so each finding",
+      "gets an \"AI 修订该段落\" button: locate that section, send only it plus the problem",
+      "and the document's heading outline to the AI, stage the rewrite for review and",
+      "hand-editing, then splice it back. Everything outside the section stays",
+      "byte-identical, and re-auditing shows the new score.",
+      "locateSection matches in three passes (exact heading, numbering/punctuation",
+      "normalized, substring) and bounds a section at the next heading of the same or",
+      "higher level, so nested ### subsections travel with their parent. Non-exact",
+      "matches are flagged in the UI. Applying re-locates by heading rather than reusing",
+      "stale offsets, since an earlier revision shifts them.",
+      "The dedupe button is gone: it only caught exact heading repeats, so on a document",
+      "the audit called \"重复三次\" it reported 未发现重复 and read as broken. Continuation",
+      "merging at generation time already prevents new duplication; existing duplication",
+      "is better handled as a finding to revise.",
+      "源程序量 fix: counting used filterByLanguageRatio, which narrows to the top three",
+      "extensions for the code appendix. Every other language was silently dropped, so a",
+      "Vue/TS-dominant repo lost its Kotlin, Java and Python files — ~100k lines",
+      "reported as ~8k. Counting now uses its own selector over all non-NON_CODE files,",
+      "shared with fetchRepoStats and estimateRepoSourceLines so the pre-generation",
+      "figure and the registered figure agree. Progress now reports read vs. estimated",
+      "file counts."
+    ]
+  },
+  {
     "hash": "c94a5c9",
     "date": "2026-07-30",
     "subject": "fix: cut manual duplication, README-derived description, line recount",
