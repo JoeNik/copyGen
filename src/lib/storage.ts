@@ -555,6 +555,16 @@ export interface Project {
   createdAt: string;
   /** Editable 文档鉴别材料 markdown (persisted after generation) */
   manualMarkdown?: string;
+  /**
+   * Lightweight repo snapshot used by AI 核对/审核 so those features work after a
+   * page refresh without re-downloading the repo. fileTree = first paths joined by
+   * newlines; codeSummary = truncated head-of-file excerpts (filled at generate time).
+   */
+  reviewContext?: {
+    fileTree: string;
+    languages: string;
+    codeSummary: string;
+  };
 }
 
 function generateId(): string {

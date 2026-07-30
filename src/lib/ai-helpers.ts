@@ -310,6 +310,292 @@ export async function callAIForText(prompt: string): Promise<string> {
   return callAI([{ role: "user", content: prompt }], config);
 }
 
+/**
+ * Robustly pull the first JSON object out of a model response that may be
+ * fenced, prefixed with prose, or followed by trailing text.
+ */
+function extractJsonObject(text: string): Record<string, unknown> | null {
+  const stripped = stripModelFences(text);
+  // Try direct parse first
+  try {
+    return JSON.parse(stripped) as Record<string, unknown>;
+  } catch {
+    /* fall through */
+  }
+  // Find the outermost balanced { ... }
+  const start = stripped.indexOf("{");
+  if (start < 0) return null;
+  let depth = 0;
+  let inStr = false;
+  let esc = false;
+  for (let i = start; i < stripped.length; i++) {
+    const ch = stripped[i];
+    if (inStr) {
+      if (esc) esc = false;
+      else if (ch === "\\") esc = true;
+      else if (ch === '"') inStr = false;
+      continue;
+    }
+    if (ch === '"') inStr = true;
+    else if (ch === "{") depth++;
+    else if (ch === "}") {
+      depth--;
+      if (depth === 0) {
+        try {
+          return JSON.parse(stripped.slice(start, i + 1)) as Record<string, unknown>;
+        } catch {
+          return null;
+        }
+      }
+    }
+  }
+  return null;
+}
+
+// ── AI review: project metadata sanity check ──
+
+export interface MetaReviewIssue {
+  /** SoftwareMeta key or a human field name */
+  field: string;
+  /** 中文字段名，便于展示 */
+  fieldLabel: string;
+  severity: "high" | "medium" | "low";
+  /** 现值有什么问题 */
+  problem: string;
+  /** 建议改成什么 */
+  suggestion: string;
+}
+
+export interface MetaReviewResult {
+  issues: MetaReviewIssue[];
+  overallComment: string;
+}
+
+const META_FIELD_LABELS: Record<string, string> = {
+  softwareName: "软件全称",
+  version: "版本号",
+  category: "软件分类",
+  purpose: "开发目的",
+  domain: "面向领域/行业",
+  mainFeatures: "主要功能",
+  technicalFeatures: "技术特点",
+  runPlatform: "运行平台",
+  runSupport: "运行支撑环境",
+  devTools: "开发工具",
+  languagesGiven: "编程语言",
+  sourceLines: "源程序行数",
+};
+
+export function buildMetaReviewPrompt(input: {
+  softwareName: string;
+  version: string;
+  repoName: string;
+  repoDescription: string;
+  languages: string;
+  fileTree: string;
+  meta: Record<string, unknown>;
+}): string {
+  return `你是中国计算机软件著作权登记材料的审核专家。下面是一个软件项目的登记信息，请逐项核对是否存在填写错误、前后矛盾、与仓库实际情况不符、或不符合软著登记规范的地方。
+
+判断依据：
+- 只依据下方提供的仓库名称、描述、编程语言、目录结构等客观事实，不要凭空想象仓库里没有的东西。
+- 软件全称应以“软件”“系统”“平台”等结尾，不含版本号；版本号形如 V1.0。
+- 运行平台/运行支撑环境应与编程语言、目录结构一致（例如 Node/前端项目不应写成仅 Windows 桌面 exe）。
+- 开发目的、主要功能、技术特点应彼此一致，且与仓库描述、目录结构相符。
+- 若某字段看起来合理、无需修改，就不要为它编造问题。
+${SOFT_COPYRIGHT_COMPLIANCE_RULES}
+
+仓库名称：${input.repoName}
+仓库描述：${input.repoDescription || "无"}
+编程语言：${input.languages || "未知"}
+目录结构（节选）：
+${input.fileTree.slice(0, 2000)}
+
+当前填写的登记信息（JSON）：
+${JSON.stringify({ softwareName: input.softwareName, version: input.version, ...input.meta }, null, 2)}
+
+只返回如下 JSON（不要输出解释、不要代码围栏）。只列出确有问题的字段，没有问题就返回空数组：
+{
+  "issues": [
+    {
+      "field": "上面 JSON 中的字段英文 key（如 purpose、runPlatform、softwareName）",
+      "severity": "high | medium | low",
+      "problem": "该字段现在的问题（一句话）",
+      "suggestion": "建议修改为的具体内容"
+    }
+  ],
+  "overallComment": "对整体填写质量的一句话总评"
+}`;
+}
+
+export async function reviewProjectMeta(input: {
+  softwareName: string;
+  version: string;
+  repoName: string;
+  repoDescription: string;
+  languages: string;
+  fileTree: string;
+  meta: Record<string, unknown>;
+}): Promise<MetaReviewResult> {
+  const { text } = await callAILong([
+    { role: "user", content: buildMetaReviewPrompt(input) },
+  ]);
+  const parsed = extractJsonObject(text);
+  if (!parsed) {
+    throw new Error("AI 未返回可解析的核对结果，请重试");
+  }
+  const rawIssues = Array.isArray(parsed.issues) ? parsed.issues : [];
+  const issues: MetaReviewIssue[] = rawIssues
+    .map((it) => it as Record<string, unknown>)
+    .filter((it) => it && typeof it.field === "string")
+    .map((it) => {
+      const field = String(it.field);
+      const sevRaw = String(it.severity || "medium");
+      const severity: "high" | "medium" | "low" =
+        sevRaw === "high" ? "high" : sevRaw === "low" ? "low" : "medium";
+      return {
+        field,
+        fieldLabel: META_FIELD_LABELS[field] || field,
+        severity,
+        problem: sanitizeSoftCopyrightText(String(it.problem || "")),
+        suggestion: sanitizeSoftCopyrightText(String(it.suggestion || "")),
+      };
+    })
+    .filter((it) => it.problem || it.suggestion);
+  return {
+    issues,
+    overallComment: sanitizeSoftCopyrightText(String(parsed.overallComment || "")),
+  };
+}
+
+// ── AI review: generated manual audit (hallucination / consistency / 软著 pass) ──
+
+export interface ManualAuditFinding {
+  severity: "high" | "medium" | "low";
+  category: string;
+  /** 出现问题的章节或位置描述 */
+  location: string;
+  problem: string;
+  suggestion: string;
+}
+
+export interface ManualAuditResult {
+  /** 0–100 文档质量总评 */
+  score: number;
+  /** 软著文档鉴别材料初步通过概率 0–100 */
+  passProbability: number;
+  summary: string;
+  /** 疑似与代码不符/编造的内容 */
+  findings: ManualAuditFinding[];
+  /** 亮点/合格项 */
+  strengths: string[];
+}
+
+export function buildManualAuditPrompt(input: {
+  softwareName: string;
+  version: string;
+  meta: Record<string, unknown>;
+  languages: string;
+  fileTree: string;
+  codeSummary: string;
+  markdown: string;
+}): string {
+  // Keep well within the model context; audit a representative slice.
+  const doc = input.markdown.length > 24000 ? input.markdown.slice(0, 24000) + "\n…（文档过长已截断）" : input.markdown;
+  return `你是中国计算机软件著作权“文档鉴别材料（操作说明书）”的审核专家。请审核下面这份 AI 生成的操作说明书，重点判断：
+1. 可用性/一致性：文档描述的功能、界面、操作流程是否与该软件的实际信息（仓库结构、编程语言、主要功能）一致，是否自相矛盾。
+2. 幻觉/编造：是否出现代码或项目信息中并不存在的功能、模块、错误码、平台、依赖（这是最严重的问题）。
+3. 软著规范：是否符合软著文档鉴别材料要求（正式说明文风、面向操作、图占位合理、不含营销/宣传/敏感表述），并给出“初步判定通过概率”。
+${SOFT_COPYRIGHT_COMPLIANCE_RULES}
+
+审核原则：
+- 只依据下方提供的客观信息判断“是否编造”，如果文档写了下方信息里完全没有依据的具体功能/模块/错误码，判为疑似幻觉。
+- 不要自己臆造问题；无法确定的从轻。
+- score（文档质量）与 passProbability（软著初步通过概率）都用 0–100 整数。
+
+软件名称：${input.softwareName} ${input.version}
+编程语言：${input.languages || "未知"}
+登记信息（JSON）：
+${JSON.stringify(input.meta, null, 2)}
+仓库目录结构（节选）：
+${input.fileTree.slice(0, 2000)}
+代码摘要（节选）：
+${input.codeSummary.slice(0, 2500)}
+
+待审核的说明书（Markdown，可能已截断）：
+"""
+${doc}
+"""
+
+只返回如下 JSON（不要解释、不要代码围栏）：
+{
+  "score": 0-100,
+  "passProbability": 0-100,
+  "summary": "整体结论（2-3句）：是否可用、主要风险",
+  "findings": [
+    {
+      "severity": "high | medium | low",
+      "category": "幻觉 | 一致性 | 软著规范 | 完整性 | 其它",
+      "location": "问题所在章节或小节",
+      "problem": "具体问题",
+      "suggestion": "如何修改"
+    }
+  ],
+  "strengths": ["合格/亮点项，若干条"]
+}`;
+}
+
+function clampScore(v: unknown): number {
+  const n = typeof v === "number" ? v : parseFloat(String(v));
+  if (!isFinite(n)) return 0;
+  return Math.max(0, Math.min(100, Math.round(n)));
+}
+
+export async function auditManualMarkdown(input: {
+  softwareName: string;
+  version: string;
+  meta: Record<string, unknown>;
+  languages: string;
+  fileTree: string;
+  codeSummary: string;
+  markdown: string;
+}): Promise<ManualAuditResult> {
+  const { text } = await callAILong([
+    { role: "user", content: buildManualAuditPrompt(input) },
+  ]);
+  const parsed = extractJsonObject(text);
+  if (!parsed) {
+    throw new Error("AI 未返回可解析的审核结果，请重试");
+  }
+  const rawFindings = Array.isArray(parsed.findings) ? parsed.findings : [];
+  const findings: ManualAuditFinding[] = rawFindings
+    .map((it) => it as Record<string, unknown>)
+    .filter(Boolean)
+    .map((it) => {
+      const sevRaw = String(it.severity || "medium");
+      const severity: "high" | "medium" | "low" =
+        sevRaw === "high" ? "high" : sevRaw === "low" ? "low" : "medium";
+      return {
+        severity,
+        category: sanitizeSoftCopyrightText(String(it.category || "其它")),
+        location: sanitizeSoftCopyrightText(String(it.location || "")),
+        problem: sanitizeSoftCopyrightText(String(it.problem || "")),
+        suggestion: sanitizeSoftCopyrightText(String(it.suggestion || "")),
+      };
+    })
+    .filter((it) => it.problem || it.suggestion);
+  const strengths = Array.isArray(parsed.strengths)
+    ? parsed.strengths.map((s) => sanitizeSoftCopyrightText(String(s))).filter(Boolean)
+    : [];
+  return {
+    score: clampScore(parsed.score),
+    passProbability: clampScore(parsed.passProbability),
+    summary: sanitizeSoftCopyrightText(String(parsed.summary || "")),
+    findings,
+    strengths,
+  };
+}
+
 export function buildAutoNamePrompt(repoName: string, description: string, language: string): string {
   return `根据以下 GitHub 仓库信息，生成一个适合中国软件著作权登记的软件全称。
 格式必须为"XXX软件"，以"软件"二字结尾，不要包含版本号。

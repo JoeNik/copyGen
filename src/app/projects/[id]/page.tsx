@@ -7,9 +7,9 @@ import { SessionProvider } from "next-auth/react";
 import { useRouter, useParams } from "next/navigation";
 import { useEffect, useState, useCallback, useRef } from "react";
 import Link from "next/link";
-import { getProject, updateProject, getAIKey, getManualDraft, clearManualDraft, type Project, type SoftwareMeta, type ManualDraft } from "@/lib/storage";
+import { getProject, updateProject, getAIKey, getManualDraft, saveManualDraft, clearManualDraft, type Project, type SoftwareMeta, type ManualDraft } from "@/lib/storage";
 import { fetchRepoBranches, fetchRepoFiles, fetchRepoStats, type GitHubBranch } from "@/lib/github";
-import { generateManualMarkdown, callAIForText, buildMetadataPrompt, sanitizeSoftCopyrightText } from "@/lib/ai-helpers";
+import { generateManualMarkdown, callAIForText, buildMetadataPrompt, sanitizeSoftCopyrightText, reviewProjectMeta, auditManualMarkdown, type MetaReviewResult, type ManualAuditResult } from "@/lib/ai-helpers";
 import { generateCodePDF } from "@/lib/docgen/code-pdf";
 import { generateManualPDF } from "@/lib/docgen/manual-pdf";
 import { parseUserAgent, detectDevTools } from "@/lib/utils";
@@ -36,6 +36,31 @@ function describeManualDraftResume(draft: ManualDraft): string {
   return `已保存 ${draft.lines || 0} 行文档草稿${chapterText}，更新时间 ${new Date(draft.updatedAt).toLocaleString("zh-CN")}。`;
 }
 
+function escapeRegExp(text: string): string {
+  return text.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+}
+
+/**
+ * Sync software name / version edits into already-generated manual markdown so the
+ * document text stays consistent with project basics — no full regeneration needed.
+ * Literal, whole-string replacement of the old values; skips no-op / empty changes.
+ */
+function syncManualMarkdownFields(
+  markdown: string,
+  changes: { oldName: string; newName: string; oldVersion: string; newVersion: string }
+): string {
+  let next = markdown;
+  const { oldName, newName, oldVersion, newVersion } = changes;
+  // Version first: older names may contain the version, replace the more specific token first.
+  if (oldVersion && newVersion && oldVersion !== newVersion) {
+    next = next.replace(new RegExp(escapeRegExp(oldVersion), "g"), newVersion);
+  }
+  if (oldName && newName && oldName !== newName) {
+    next = next.replace(new RegExp(escapeRegExp(oldName), "g"), newName);
+  }
+  return next;
+}
+
 function ProjectDetailContent() {
   const { data: session, status } = useSession();
   const router = useRouter();
@@ -58,10 +83,20 @@ function ProjectDetailContent() {
   const [reexporting, setReexporting] = useState(false);
   const [editingProject, setEditingProject] = useState(false);
   const [projectDraft, setProjectDraft] = useState({ softwareName: "", version: "", completedAt: "", branch: "" });
+  const [forceRegenerate, setForceRegenerate] = useState(false);
   const [branches, setBranches] = useState<GitHubBranch[]>([]);
   const [loadingBranches, setLoadingBranches] = useState(false);
   const [branchesLoadAttempted, setBranchesLoadAttempted] = useState(false);
   const [savingProject, setSavingProject] = useState(false);
+
+  // AI 核对项目信息 / 审核说明书
+  const [metaReview, setMetaReview] = useState<MetaReviewResult | null>(null);
+  const [reviewingMeta, setReviewingMeta] = useState(false);
+  const [metaReviewError, setMetaReviewError] = useState("");
+  const [appliedIssues, setAppliedIssues] = useState<Record<string, boolean>>({});
+  const [manualAudit, setManualAudit] = useState<ManualAuditResult | null>(null);
+  const [auditingManual, setAuditingManual] = useState(false);
+  const [auditError, setAuditError] = useState("");
 
   // Track live generation so unmount/close can flip PROCESSING → FAILED.
   const generatingRef = useRef(false);
@@ -127,21 +162,6 @@ function ProjectDetailContent() {
     void loadProject();
     return () => { active = false; };
   }, [projectId, session, router]);
-
-  useEffect(() => {
-    if (!editingProject || !project || !accessToken || branchesLoadAttempted) return;
-    setBranchesLoadAttempted(true);
-    setLoadingBranches(true);
-    fetchRepoBranches(accessToken, project.repoOwner, project.repoName)
-      .then((data) => {
-        setBranches(data);
-        setLoadingBranches(false);
-      })
-      .catch((e) => {
-        setError(e instanceof Error ? e.message : "获取仓库分支列表失败，请手动填写分支名");
-        setLoadingBranches(false);
-      });
-  }, [editingProject, project, accessToken, branchesLoadAttempted]);
 
   // If user navigates away / closes tab while generating, persist interrupted state.
   useEffect(() => {
@@ -282,6 +302,12 @@ function ProjectDetailContent() {
       const totalSourceLines = files.reduce((sum, f) => sum + f.content.split("\n").length, 0);
       setMeta((prev) => prev ? { ...prev, sourceLines: totalSourceLines } : prev);
 
+      // Persist lightweight repo snapshot for AI 核对/审核 after page refresh
+      updateProject(projectId, {
+        reviewContext: { fileTree, languages: languageStr, codeSummary },
+      });
+      setProject(getProject(projectId)!);
+
       // Step 2: AI metadata (already done in detectMeta, just confirm)
       setStepIndex(2); setCurrentStep("正在确认元数据..."); setProgress(30);
 
@@ -381,8 +407,24 @@ function ProjectDetailContent() {
       completedAt: project.completedAt || "",
       branch: project.defaultBranch,
     });
+    setForceRegenerate(false);
     setEditingProject(true);
     setError("");
+
+    // Load branch list once per edit session so the select shows real options.
+    if (accessToken && !branchesLoadAttempted) {
+      setBranchesLoadAttempted(true);
+      setLoadingBranches(true);
+      fetchRepoBranches(accessToken, project.repoOwner, project.repoName)
+        .then((data) => {
+          setBranches(data);
+          setLoadingBranches(false);
+        })
+        .catch((e) => {
+          setError(e instanceof Error ? e.message : "获取仓库分支列表失败，请手动填写分支名");
+          setLoadingBranches(false);
+        });
+    }
   };
 
   const handleSaveProjectEdit = () => {
@@ -397,44 +439,85 @@ function ProjectDetailContent() {
 
     setSavingProject(true);
     const branchChanged = branch !== project.defaultBranch;
-    const materialIdentityChanged = branchChanged || softwareName !== project.softwareName || version !== project.version;
-    const nextMeta: SoftwareMeta = branchChanged
-      ? {
-          ...meta,
-          sourceLines: 0,
-          devTools: "",
-          languagesGiven: [],
-          runPlatform: "",
-          runSupport: "",
-          purpose: "",
-          domain: "",
-          mainFeatures: "",
-          technicalFeatures: "",
-        }
-      : meta;
+    const nameChanged = softwareName !== project.softwareName;
+    const versionChanged = version !== project.version;
 
-    if (materialIdentityChanged) {
+    // Branch change OR user explicitly checked "force regenerate" means the
+    // generated materials no longer apply and must be cleared.
+    if (branchChanged || forceRegenerate) {
+      const resetMeta: SoftwareMeta = {
+        ...meta,
+        sourceLines: 0,
+        devTools: "",
+        languagesGiven: [],
+        runPlatform: "",
+        runSupport: "",
+        purpose: "",
+        domain: "",
+        mainFeatures: "",
+        technicalFeatures: "",
+      };
       clearManualDraft(projectId);
       setManualDraft(null);
       setManualMarkdown("");
       setCodePdfUrl(null);
       setManualPdfUrl(null);
-    }
-
-    if (branchChanged) {
       setMetaReady(false);
-    }
 
-    updateProject(projectId, {
-      softwareName,
-      version,
-      completedAt: projectDraft.completedAt,
-      defaultBranch: branch,
-      meta: nextMeta,
-      status: materialIdentityChanged ? "PENDING" : project.status,
-      errorMsg: undefined,
-      manualMarkdown: materialIdentityChanged ? undefined : project.manualMarkdown,
-    });
+      updateProject(projectId, {
+        softwareName,
+        version,
+        completedAt: projectDraft.completedAt,
+        defaultBranch: branch,
+        meta: resetMeta,
+        status: "PENDING",
+        errorMsg: undefined,
+        manualMarkdown: undefined,
+      });
+    } else {
+      // Keep the generated document; sync renamed software name / version into it.
+      const fieldsChanged = nameChanged || versionChanged;
+      const syncFields = {
+        oldName: project.softwareName,
+        newName: softwareName,
+        oldVersion: project.version,
+        newVersion: version,
+      };
+
+      let nextManualMarkdown = project.manualMarkdown;
+      if (fieldsChanged && project.manualMarkdown) {
+        nextManualMarkdown = syncManualMarkdownFields(project.manualMarkdown, syncFields);
+        setManualMarkdown(nextManualMarkdown);
+      }
+
+      if (fieldsChanged) {
+        const draft = getManualDraft(projectId);
+        if (draft?.markdown) {
+          const syncedDraft: ManualDraft = {
+            ...draft,
+            softwareName,
+            version,
+            markdown: syncManualMarkdownFields(draft.markdown, syncFields),
+          };
+          saveManualDraft(syncedDraft);
+          setManualDraft(syncedDraft);
+        }
+        // In-memory PDFs were rendered with the old name/version → invalidate so
+        // the user re-exports to keep the file content consistent.
+        if (codePdfUrl) { URL.revokeObjectURL(codePdfUrl); setCodePdfUrl(null); }
+        if (manualPdfUrl) { URL.revokeObjectURL(manualPdfUrl); setManualPdfUrl(null); }
+      }
+
+      updateProject(projectId, {
+        softwareName,
+        version,
+        completedAt: projectDraft.completedAt,
+        defaultBranch: branch,
+        meta,
+        errorMsg: undefined,
+        manualMarkdown: nextManualMarkdown,
+      });
+    }
 
     const updated = getProject(projectId)!;
     setProject(updated);
@@ -448,6 +531,74 @@ function ProjectDetailContent() {
     setError("");
     setEditingProject(false);
     setSavingProject(false);
+  };
+
+  const handleReviewMeta = async () => {
+    if (!project || !meta || !accessToken) return;
+    setReviewingMeta(true);
+    setMetaReviewError("");
+    setMetaReview(null);
+    try {
+      const ctx = project.reviewContext;
+      if (!ctx?.fileTree || !ctx?.languages) {
+        throw new Error("缺少仓库上下文，请先生成一次材料");
+      }
+      const result = await reviewProjectMeta({
+        softwareName: project.softwareName,
+        version: project.version,
+        repoName: project.repoName,
+        repoDescription: project.repoUrl,
+        languages: ctx.languages,
+        fileTree: ctx.fileTree,
+        meta: meta as unknown as Record<string, unknown>,
+      });
+      setMetaReview(result);
+      setAppliedIssues({});
+    } catch (e) {
+      setMetaReviewError(e instanceof Error ? e.message : "核对失败，请重试");
+    } finally {
+      setReviewingMeta(false);
+    }
+  };
+
+  const handleApplySuggestion = (field: string, suggestion: string) => {
+    if (!meta) return;
+    const next = { ...meta, [field]: suggestion };
+    setMeta(next);
+    setAppliedIssues((prev) => ({ ...prev, [field]: true }));
+  };
+
+  const handleAuditManual = async () => {
+    if (!project || !meta) return;
+    const md = manualMarkdown || project.manualMarkdown;
+    if (!md?.trim()) {
+      setAuditError("没有可审核的说明书内容");
+      return;
+    }
+    const ctx = project.reviewContext;
+    if (!ctx?.fileTree || !ctx?.languages || !ctx?.codeSummary) {
+      setAuditError("缺少仓库上下文，请先生成一次材料");
+      return;
+    }
+    setAuditingManual(true);
+    setAuditError("");
+    setManualAudit(null);
+    try {
+      const result = await auditManualMarkdown({
+        softwareName: project.softwareName,
+        version: project.version,
+        meta: meta as unknown as Record<string, unknown>,
+        languages: ctx.languages,
+        fileTree: ctx.fileTree,
+        codeSummary: ctx.codeSummary,
+        markdown: md,
+      });
+      setManualAudit(result);
+    } catch (e) {
+      setAuditError(e instanceof Error ? e.message : "审核失败，请重试");
+    } finally {
+      setAuditingManual(false);
+    }
   };
 
   const handleReexportManualPDF = async () => {
@@ -631,6 +782,20 @@ function ProjectDetailContent() {
                   </p>
                 ) : null}
 
+                {projectDraft.branch.trim() === project.defaultBranch && (project.manualMarkdown || manualMarkdown) && (
+                  <label className="flex items-start gap-2 text-xs cursor-pointer">
+                    <input
+                      type="checkbox"
+                      checked={forceRegenerate}
+                      onChange={(e) => setForceRegenerate(e.target.checked)}
+                      className="mt-0.5"
+                    />
+                    <span className="text-[var(--color-muted)]">
+                      清空已生成的材料，保存后重新生成（仅改名字/版本时，默认同步文稿而不清空；勾选此项则强制清空）
+                    </span>
+                  </label>
+                )}
+
                 <div className="flex flex-wrap gap-2">
                   <button
                     onClick={handleSaveProjectEdit}
@@ -655,8 +820,102 @@ function ProjectDetailContent() {
         {project.status === "PENDING" && !generating && (
           <div className="space-y-6">
             <div className="bg-[var(--color-card)] border border-[var(--color-border)] rounded-xl p-5">
-              <h2 className="text-base font-semibold mb-4">软件信息（自动生成，可编辑）</h2>
+              <div className="flex items-start justify-between gap-4 mb-4">
+                <h2 className="text-base font-semibold">软件信息（自动生成，可编辑）</h2>
+                <button
+                  onClick={handleReviewMeta}
+                  disabled={reviewingMeta || !metaReady || !project.reviewContext}
+                  className="px-3 py-1.5 text-xs border border-[var(--color-border)] rounded-lg hover:border-[var(--color-primary)] transition-colors disabled:opacity-50 flex items-center gap-1.5"
+                  title={!project.reviewContext ? "请先生成一次材料后再核对" : "AI 核对当前填写是否合理"}
+                >
+                  {reviewingMeta ? (
+                    <>
+                      <div className="spinner w-3 h-3 border border-[var(--color-primary)] border-t-transparent rounded-full" />
+                      AI 核对中...
+                    </>
+                  ) : (
+                    <>
+                      <svg className="w-3.5 h-3.5" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+                        <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M9 12l2 2 4-4m6 2a9 9 0 11-18 0 9 9 0 0118 0z" />
+                      </svg>
+                      AI 核对
+                    </>
+                  )}
+                </button>
+              </div>
               {!metaReady && <p className="text-xs text-[var(--color-primary)] mb-4">正在自动检测和生成元数据...</p>}
+
+              {metaReviewError && (
+                <div className="mb-4 bg-[var(--color-error)]/10 border border-[var(--color-error)]/20 rounded-lg p-3 text-xs text-[var(--color-error)]">
+                  {metaReviewError}
+                </div>
+              )}
+
+              {metaReview && (
+                <div className="mb-4 bg-[#F2E3D6] border border-[#C4612F]/20 rounded-lg p-4">
+                  <div className="flex items-start gap-2 mb-3">
+                    <svg className="w-4 h-4 text-[#C4612F] flex-shrink-0 mt-0.5" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+                      <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M9 12l2 2 4-4m6 2a9 9 0 11-18 0 9 9 0 0118 0z" />
+                    </svg>
+                    <div className="min-w-0 flex-1">
+                      <div className="text-xs font-medium text-[#1F2421] mb-1">AI 核对结果</div>
+                      <p className="text-xs text-[#5C635D]">{metaReview.overallComment}</p>
+                    </div>
+                  </div>
+                  {metaReview.issues.length === 0 ? (
+                    <p className="text-xs text-[#5C635D] pl-6">未发现明显问题。</p>
+                  ) : (
+                    <div className="space-y-2 pl-6">
+                      {metaReview.issues.map((issue, idx) => {
+                        const applied = appliedIssues[issue.field];
+                        return (
+                          <div
+                            key={idx}
+                            className={`border rounded-lg p-3 text-xs ${
+                              applied
+                                ? "border-[var(--color-success)]/30 bg-[var(--color-success)]/5 opacity-60"
+                                : issue.severity === "high"
+                                ? "border-[var(--color-error)]/30 bg-[var(--color-error)]/5"
+                                : "border-[var(--color-border)] bg-[var(--color-card)]"
+                            }`}
+                          >
+                            <div className="flex items-start justify-between gap-2 mb-1">
+                              <span className="font-medium text-[#1F2421]">{issue.fieldLabel}</span>
+                              <span
+                                className={`px-1.5 py-0.5 rounded text-[10px] ${
+                                  issue.severity === "high"
+                                    ? "bg-[var(--color-error)]/20 text-[var(--color-error)]"
+                                    : issue.severity === "low"
+                                    ? "bg-[var(--color-muted)]/20 text-[var(--color-muted)]"
+                                    : "bg-[#C4612F]/20 text-[#C4612F]"
+                                }`}
+                              >
+                                {issue.severity === "high" ? "严重" : issue.severity === "low" ? "轻微" : "中等"}
+                              </span>
+                            </div>
+                            <p className="text-[#5C635D] mb-2">问题：{issue.problem}</p>
+                            <div className="flex items-start gap-2">
+                              <p className="text-[#5C635D] flex-1 min-w-0">建议：{issue.suggestion}</p>
+                              {!applied && (
+                                <button
+                                  onClick={() => handleApplySuggestion(issue.field, issue.suggestion)}
+                                  className="flex-shrink-0 px-2 py-1 text-[10px] border border-[var(--color-border)] rounded hover:border-[var(--color-primary)] transition-colors"
+                                >
+                                  应用
+                                </button>
+                              )}
+                              {applied && (
+                                <span className="flex-shrink-0 text-[10px] text-[var(--color-success)]">✓ 已应用</span>
+                              )}
+                            </div>
+                          </div>
+                        );
+                      })}
+                    </div>
+                  )}
+                </div>
+              )}
+
               <div className="grid grid-cols-2 gap-4 text-sm">
                 <MetaField label="软件分类" value={meta.category} />
                 <MetaField label="编程语言" value={meta.languagesGiven.join(", ") || "检测中..."} />
@@ -818,6 +1077,128 @@ function ProjectDetailContent() {
               )}
               {currentStep && reexporting && (
                 <p className="text-xs text-[var(--color-primary)]">{currentStep}</p>
+              )}
+            </div>
+
+            {/* AI 审核说明书 */}
+            <div className="bg-[var(--color-card)] border border-[var(--color-border)] rounded-xl p-5 space-y-3">
+              <div className="flex items-start justify-between gap-4 flex-wrap">
+                <div>
+                  <h2 className="text-base font-semibold">AI 审核说明书</h2>
+                  <p className="text-xs text-[var(--color-muted)] mt-1">
+                    检查文档是否与项目一致、是否存在幻觉/编造、是否符合软著规范，并给出初步通过概率评估。
+                  </p>
+                </div>
+                <button
+                  onClick={handleAuditManual}
+                  disabled={auditingManual || !project.reviewContext}
+                  className="px-3 py-1.5 text-xs border border-[var(--color-border)] rounded-lg hover:border-[var(--color-primary)] transition-colors disabled:opacity-50 flex items-center gap-1.5"
+                  title={!project.reviewContext ? "请先生成一次材料后再审核" : "AI 审核当前说明书质量"}
+                >
+                  {auditingManual ? (
+                    <>
+                      <div className="spinner w-3 h-3 border border-[var(--color-primary)] border-t-transparent rounded-full" />
+                      审核中...
+                    </>
+                  ) : (
+                    <>
+                      <svg className="w-3.5 h-3.5" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+                        <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M9 5H7a2 2 0 00-2 2v12a2 2 0 002 2h10a2 2 0 002-2V7a2 2 0 00-2-2h-2M9 5a2 2 0 002 2h2a2 2 0 002-2M9 5a2 2 0 012-2h2a2 2 0 012 2m-6 9l2 2 4-4" />
+                      </svg>
+                      审核说明书
+                    </>
+                  )}
+                </button>
+              </div>
+
+              {auditError && (
+                <div className="bg-[var(--color-error)]/10 border border-[var(--color-error)]/20 rounded-lg p-3 text-xs text-[var(--color-error)]">
+                  {auditError}
+                </div>
+              )}
+
+              {manualAudit && (
+                <div className="bg-[#F2E3D6] border border-[#C4612F]/20 rounded-lg p-4 space-y-3">
+                  <div className="grid grid-cols-2 gap-4">
+                    <div className="bg-white/60 rounded-lg p-3">
+                      <div className="text-xs text-[#5C635D] mb-1">文档质量评分</div>
+                      <div className="text-2xl font-semibold text-[#1F2421]">{manualAudit.score}<span className="text-sm text-[#5C635D]">/100</span></div>
+                    </div>
+                    <div className="bg-white/60 rounded-lg p-3">
+                      <div className="text-xs text-[#5C635D] mb-1">初步通过概率</div>
+                      <div className="text-2xl font-semibold text-[#1F2421]">{manualAudit.passProbability}<span className="text-sm text-[#5C635D]">%</span></div>
+                    </div>
+                  </div>
+
+                  <div>
+                    <div className="text-xs font-medium text-[#1F2421] mb-1">总体评价</div>
+                    <p className="text-xs text-[#5C635D]">{manualAudit.summary}</p>
+                  </div>
+
+                  {manualAudit.strengths.length > 0 && (
+                    <div>
+                      <div className="text-xs font-medium text-[#1F2421] mb-2 flex items-center gap-1.5">
+                        <svg className="w-3.5 h-3.5 text-[var(--color-success)]" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+                          <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M5 13l4 4L19 7" />
+                        </svg>
+                        合格项/亮点
+                      </div>
+                      <ul className="space-y-1 text-xs text-[#5C635D] pl-5">
+                        {manualAudit.strengths.map((s, idx) => (
+                          <li key={idx} className="list-disc">{s}</li>
+                        ))}
+                      </ul>
+                    </div>
+                  )}
+
+                  {manualAudit.findings.length > 0 && (
+                    <div>
+                      <div className="text-xs font-medium text-[#1F2421] mb-2 flex items-center gap-1.5">
+                        <svg className="w-3.5 h-3.5 text-[var(--color-error)]" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+                          <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M12 9v2m0 4h.01m-6.938 4h13.856c1.54 0 2.502-1.667 1.732-3L13.732 4c-.77-1.333-2.694-1.333-3.464 0L3.34 16c-.77 1.333.192 3 1.732 3z" />
+                        </svg>
+                        发现的问题 ({manualAudit.findings.length})
+                      </div>
+                      <div className="space-y-2">
+                        {manualAudit.findings.map((finding, idx) => (
+                          <div
+                            key={idx}
+                            className={`border rounded-lg p-3 text-xs ${
+                              finding.severity === "high"
+                                ? "border-[var(--color-error)]/30 bg-[var(--color-error)]/5"
+                                : finding.severity === "low"
+                                ? "border-[var(--color-border)] bg-white/40"
+                                : "border-[#C4612F]/30 bg-white/60"
+                            }`}
+                          >
+                            <div className="flex items-start justify-between gap-2 mb-1">
+                              <span className="font-medium text-[#1F2421]">{finding.category}</span>
+                              <span
+                                className={`px-1.5 py-0.5 rounded text-[10px] ${
+                                  finding.severity === "high"
+                                    ? "bg-[var(--color-error)]/20 text-[var(--color-error)]"
+                                    : finding.severity === "low"
+                                    ? "bg-[var(--color-muted)]/20 text-[var(--color-muted)]"
+                                    : "bg-[#C4612F]/20 text-[#C4612F]"
+                                }`}
+                              >
+                                {finding.severity === "high" ? "严重" : finding.severity === "low" ? "轻微" : "中等"}
+                              </span>
+                            </div>
+                            {finding.location && (
+                              <p className="text-[#5C635D] mb-1">位置：{finding.location}</p>
+                            )}
+                            <p className="text-[#5C635D] mb-1">问题：{finding.problem}</p>
+                            <p className="text-[#5C635D]">建议：{finding.suggestion}</p>
+                          </div>
+                        ))}
+                      </div>
+                      <p className="text-[10px] text-[#5C635D] mt-2">
+                        提示：请在上方「编辑文稿」区域修改 Markdown，再点「重新导出 PDF」。
+                      </p>
+                    </div>
+                  )}
+                </div>
               )}
             </div>
 
