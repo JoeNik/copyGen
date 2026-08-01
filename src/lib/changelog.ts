@@ -11,6 +11,36 @@ export interface ChangelogEntry {
 
 export const CHANGELOG: ChangelogEntry[] = [
   {
+    "hash": "fcc14eb",
+    "date": "2026-07-31",
+    "subject": "feat: editable review rules, evidence-checked revision, raw line counting",
+    "details": [
+      "Review rules are now user-editable and importable. Two separate buckets — audit",
+      "rules (make the reviewer stricter) and writing rules (constrain the generator) —",
+      "kept apart because merging them made the reviewer flag its own instructions.",
+      "Both are appended verbatim to the relevant prompts. A rules repository can be",
+      "imported: read its Markdown, have the AI distil checkable rules, preview, then",
+      "merge or replace. Editor reachable from the dashboard and the audit panel.",
+      "Targeted revision no longer trusts the anchor blindly. Concrete tokens the",
+      "finding accuses the document of containing (quoted spans, ports, versions,",
+      "script names, CamelCase identifiers) are extracted and must actually appear in",
+      "the located section; when they don't, the user is asked to confirm rather than",
+      "rewriting text that may be correct. Ambiguous anchors report the other matching",
+      "headings, a dropdown lets the user pick the section by hand, and the revision",
+      "prompt now carries a minimum-change rule plus the evidence list with explicit",
+      "permission to return the original unchanged. The UI reports when nothing changed,",
+      "which is itself a signal the finding was mislocated.",
+      "源程序量 was still undercounting after the previous fix: lines were counted on the",
+      "comment-stripped copy while blob sizes on the other side of the ratio are raw",
+      "bytes, so bytes-per-line came out inflated and every estimate shrank. Counting",
+      "now uses raw line counts throughout, the calibration ratio is measured per",
+      "extension (a .java line is far longer than a .py line, so one global ratio is",
+      "wrong for every language but the average), GitHub's tree `truncated` flag is",
+      "surfaced instead of silently reporting a partial total, and a per-extension",
+      "breakdown makes the figure auditable."
+    ]
+  },
+  {
     "hash": "e45932b",
     "date": "2026-07-31",
     "subject": "feat: per-finding AI revision; fix 源程序量 undercount",

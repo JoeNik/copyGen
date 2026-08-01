@@ -157,12 +157,18 @@ export function cleanManualMarkdown(markdown: string): string {
   return out.join("\n").replace(/\n{3,}/g, "\n\n").trim();
 }
 
+/** Measure the real A4 body-page count using the same layout engine as PDF export. */
+export async function countManualBodyPages(markdown: string): Promise<number> {
+  const cleaned = cleanManualMarkdown(markdown);
+  const blocks = markdownToBlocks(cleaned);
+  const pages = await paginateByHeight(blocks);
+  return pages.length;
+}
+
 /**
  * 一般交存 requires the first 30 and last 30 consecutive pages of the document,
- * so 60 body pages is the target deposit size. Rendering far beyond that also
- * risks exhausting the renderer: every page is rasterised to a canvas and held
- * in the PDF until output, and an OOM kill shows up as the browser's blank
- * "This page couldn't load" screen with no JS error to catch.
+ * or the complete document when it contains fewer than 60 body pages. This is
+ * an export selection rule; it must not limit generation of the complete manual.
  */
 const MAX_BODY_PAGES = 60;
 const FRONT_PAGES = 30;
@@ -213,13 +219,7 @@ export async function generateManualPDF(
     );
   }
 
-  // Soft-copyright general deposit prefers ~30+30 pages of documentation.
-  // We keep natural pagination; only pad lightly if extremely short.
   const pages: string[] = [coverHTML, tocHTML, ...bodyPages];
-  const MIN_TOTAL = 20;
-  while (pages.length < MIN_TOTAL) {
-    pages.push("<p>&nbsp;</p>");
-  }
 
   onProgress?.(`正在高清渲染 PDF（共 ${pages.length} 页）...`);
   return renderPagesToPDF(pages, {

@@ -473,6 +473,10 @@ export interface ManualDraft {
   complete?: boolean;
   /** chapter index for chapter-wise generation resume (0-based) */
   nextChapterIndex?: number;
+  /** Current resumable stage after the eight base chapters are complete. */
+  phase?: "chapters" | "page-expansion";
+  /** Next source-evidence expansion call to run within the current expansion cycle. */
+  nextExpansionRound?: number;
 }
 
 function draftKey(projectId: string) {
