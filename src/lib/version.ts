@@ -5,4 +5,4 @@
  * commit (see `npm run bump:patch`). Edit MAJOR/MINOR by hand when the release
  * warrants it.
  */
-export const APP_VERSION = "0.1.9";
+export const APP_VERSION = "0.1.10";

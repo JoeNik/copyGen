@@ -53,15 +53,14 @@ export async function safeFetch(
 
     clearTimeout(timer);
 
-    // Build a web Response from undici's ResponseData so downstream code can
-    // use .status/.ok/.body/.text() uniformly.
+    // Build a web Response from undici's ResponseData. We deliberately do NOT
+    // copy upstream headers: undici's headers object carries Symbol-keyed
+    // entries (e.g. Symbol(sensitiveHeaders)) that the web Headers constructor
+    // rejects with "cannot be converted to a ByteString". Callers only need
+    // status and body, so we pass those alone.
     const status = responseData.statusCode;
     const body = responseData.body as unknown as ReadableStream<Uint8Array>;
-    const response = new Response(body, {
-      status,
-      headers: responseData.headers as HeadersInit,
-    });
-    return response;
+    return new Response(body, { status });
   } catch (err) {
     clearTimeout(timer);
     await dispatcher.close().catch(() => {});

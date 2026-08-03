@@ -8,6 +8,9 @@ import { AIError, AIErrorCodes } from "@/lib/server/ai/errors";
 
 export const runtime = "nodejs";
 export const dynamic = "force-dynamic";
+// Long-form manual generation can run well beyond Vercel's default function
+// timeout; allow the handler to stay alive long enough to stream a full chapter.
+export const maxDuration = 300;
 
 const DEFAULT_MAX_TOKENS = 200;
 const MAX_MAX_TOKENS = 8192;
