@@ -35,9 +35,10 @@ const AGREEMENT_TEXT = `软著通 用户服务协议
 4. AI 使用规范：您理解本工具使用人工智能技术辅助生成文档内容，AI 生成的内容可能存在不准确之处。您有义务对 AI 生成的内容进行审核、修改和完善，确保最终材料符合实际情况和法律要求。您不得利用本工具的 AI 功能生成虚假、误导性或违法违规内容。
 
 三、数据安全与隐私
-1. 本工具采用纯前端架构，您的代码和生成的文档仅在浏览器本地处理，不会上传至任何第三方服务器（AI API 调用除外）。
-2. 您的 GitHub Token、API Key 等敏感信息仅存储在浏览器本地 localStorage 中，本工具不会收集、存储或传输这些信息。
-3. AI 生成过程中，部分代码摘要和仓库信息会发送至您配置的 AI 服务提供商，您应了解并接受相关服务提供商的数据处理政策。
+1. 本工具的代码分析与文档排版在浏览器本地完成，但 AI 生成（包括说明书撰写、项目元数据分析、规则提炼等）会通过本工具的服务端接口转发给您配置的 AI 服务提供商。生成所需的提示词、代码摘要和仓库信息会经本工具服务器传输至该供应商。
+2. 您配置的 AI 提供商信息（Base URL、模型、API Key）仅保存在浏览器本地 localStorage，不写入数据库。调用时，API Key 会随请求临时发送到本工具服务器用于当次转发，本工具不在服务器落库、不记录密钥、不缓存密钥。
+3. 您应了解并接受所配置 AI 服务供应商的数据处理政策，并确认将代码摘要和仓库信息发送给该供应商符合您的合规要求。
+4. 本工具依赖 GitHub 授权登录，访问需 GitHub 账户。
 
 四、免责声明
 1. 本工具按"现状"提供服务，不保证生成材料能够成功通过软件著作权登记审核。
@@ -118,7 +119,7 @@ function LandingContent() {
             选择你的 GitHub 仓库，AI 自动生成符合国家版权局规范的源程序代码文档和软件说明书，打包下载即可提交申报。
           </p>
           <p className="text-sm text-[var(--color-muted)] max-w-2xl mx-auto mb-10">
-            所有数据仅在浏览器本地处理，代码不会上传至任何服务器。
+            代码分析与文档排版在本地完成；AI 生成经本工具服务端转发至您配置的供应商，密钥仅存浏览器不落库。
           </p>
           {session && aiReady && agreed ? (
             <Link href="/dashboard" className="inline-block px-8 py-3 bg-[var(--color-primary)] hover:bg-[var(--color-primary-hover)] text-white rounded-lg font-medium transition-colors text-base">
@@ -157,7 +158,7 @@ function LandingContent() {
 
       <footer className="border-t border-[var(--color-border)] py-6 px-6">
         <div className="max-w-6xl mx-auto flex items-center justify-between text-sm text-[var(--color-muted)]">
-          <span>软著通 v{APP_VERSION} - 纯本地处理，保护你的代码隐私</span>
+          <span>软著通 v{APP_VERSION} - 本地分析 + 服务端 AI 转发，密钥不落库</span>
           <a href="https://github.com/JoeNik/copyGen" target="_blank" rel="noopener noreferrer" className="hover:text-[var(--color-foreground)] transition-colors flex items-center gap-1">
             <svg className="w-4 h-4" viewBox="0 0 24 24" fill="currentColor"><path d="M12 0C5.37 0 0 5.37 0 12c0 5.31 3.435 9.795 8.205 11.385.6.105.825-.255.825-.57 0-.285-.015-1.23-.015-2.235-3.015.555-3.795-.735-4.035-1.41-.135-.345-.72-1.41-1.23-1.695-.42-.225-1.02-.78-.015-.795.945-.015 1.62.87 1.845 1.23 1.08 1.815 2.805 1.305 3.495.99.105-.78.42-1.305.765-1.605-2.67-.3-5.46-1.335-5.46-5.925 0-1.305.465-2.385 1.23-3.225-.12-.3-.54-1.53.12-3.18 0 0 1.005-.315 3.3 1.23.96-.27 1.98-.405 3-.405s2.04.135 3 .405c2.295-1.56 3.3-1.23 3.3-1.23.66 1.65.24 2.88.12 3.18.765.84 1.23 1.905 1.23 3.225 0 4.605-2.805 5.625-5.475 5.925.435.375.81 1.095.81 2.22 0 1.605-.015 2.895-.015 3.3 0 .315.225.69.825.57A12.02 12.02 0 0024 12c0-6.63-5.37-12-12-12z"/></svg>
             GitHub

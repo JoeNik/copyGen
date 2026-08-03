@@ -11,6 +11,12 @@ export interface ChangelogEntry {
 
 export const CHANGELOG: ChangelogEntry[] = [
   {
+    "hash": "fe28dd3",
+    "date": "2026-08-01",
+    "subject": "feat: improve copyright manual generation and review",
+    "details": []
+  },
+  {
     "hash": "fcc14eb",
     "date": "2026-07-31",
     "subject": "feat: editable review rules, evidence-checked revision, raw line counting",
