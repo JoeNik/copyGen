@@ -12,6 +12,13 @@ import {
   type AIProtocol,
   type AIProviderConfig,
 } from "@/lib/storage";
+import {
+  fetchModels,
+  testModel,
+  DiagnosticsError,
+  type AIModelOption,
+  type ModelTestResult,
+} from "@/lib/ai/provider-diagnostics-client";
 
 interface Props {
   onClose: () => void;
@@ -38,11 +45,38 @@ export default function AISettingsModal({ onClose, onSaved }: Props) {
   const [error, setError] = useState("");
   const [confirmRemove, setConfirmRemove] = useState<string | null>(null);
 
+  // Model-list discovery + connectivity test state, separate from save state.
+  const [modelOptions, setModelOptions] = useState<AIModelOption[]>([]);
+  const [modelsLoading, setModelsLoading] = useState(false);
+  const [modelsError, setModelsError] = useState("");
+  const [modelSearch, setModelSearch] = useState("");
+  const [showModelList, setShowModelList] = useState(false);
+  const [modelsStale, setModelsStale] = useState(false);
+  const [testResult, setTestResult] = useState<ModelTestResult | null>(null);
+  const [testLoading, setTestLoading] = useState(false);
+  const [testError, setTestError] = useState("");
+  const [testStale, setTestStale] = useState(false);
+
   const refresh = () => setTick((t) => t + 1);
+
+  // When the user edits anything that affects the upstream connection,
+  // invalidate previously-fetched model lists and test results.
+  const invalidateDiagnostics = () => {
+    setModelsStale(true);
+    setTestStale(true);
+  };
 
   const openEdit = (p: AIProviderConfig & { isPreset?: boolean }) => {
     setError("");
     setConfirmRemove(null);
+    setModelOptions([]);
+    setModelsError("");
+    setTestResult(null);
+    setTestError("");
+    setModelsStale(false);
+    setTestStale(false);
+    setShowModelList(false);
+    setModelSearch("");
     const preset = getProviderPreset(p.id);
     setEditing({
       id: p.id,
@@ -74,6 +108,85 @@ export default function AISettingsModal({ onClose, onSaved }: Props) {
       onSaved?.();
     } catch (e) {
       setError(e instanceof Error ? e.message : "启用失败");
+    }
+  };
+
+  /** Fetch the provider's model list using the *current unsaved* form values. */
+  const handleFetchModels = async () => {
+    if (!editing) return;
+    if (!editing.apiKey.trim()) {
+      setModelsError("请先填写 API Key");
+      return;
+    }
+    if (!editing.baseUrl.trim()) {
+      setModelsError("请先填写 Base URL");
+      return;
+    }
+    setModelsLoading(true);
+    setModelsError("");
+    setShowModelList(true);
+    setModelsStale(false);
+    try {
+      const models = await fetchModels({
+        protocol: editing.protocol,
+        baseUrl: editing.baseUrl,
+        apiKey: editing.apiKey,
+      });
+      setModelOptions(models);
+      if (models.length === 0) {
+        setModelsError("供应商未返回任何模型，您可以手动输入模型名称");
+      }
+    } catch (e) {
+      if (e instanceof DiagnosticsError) {
+        if (e.code === "MODEL_LIST_UNSUPPORTED") {
+          setModelsError("该供应商不支持自动获取模型列表，您可以直接输入模型名称");
+          setModelOptions([]);
+        } else {
+          setModelsError(`${e.message}${e.suggestion ? `（${e.suggestion}）` : ""}`);
+        }
+      } else {
+        setModelsError(e instanceof Error ? e.message : "获取模型列表失败");
+      }
+    } finally {
+      setModelsLoading(false);
+    }
+  };
+
+  /** Run a minimal real-generation test against the current form's model. */
+  const handleTestModel = async () => {
+    if (!editing) return;
+    if (!editing.apiKey.trim()) {
+      setTestError("请先填写 API Key");
+      return;
+    }
+    if (!editing.baseUrl.trim()) {
+      setTestError("请先填写 Base URL");
+      return;
+    }
+    if (!editing.model.trim()) {
+      setTestError("请先填写模型名称");
+      return;
+    }
+    setTestLoading(true);
+    setTestError("");
+    setTestResult(null);
+    setTestStale(false);
+    try {
+      const result = await testModel({
+        protocol: editing.protocol,
+        baseUrl: editing.baseUrl,
+        model: editing.model,
+        apiKey: editing.apiKey,
+      });
+      setTestResult(result);
+    } catch (e) {
+      if (e instanceof DiagnosticsError) {
+        setTestError(`${e.message}${e.suggestion ? `（${e.suggestion}）` : ""}`);
+      } else {
+        setTestError(e instanceof Error ? e.message : "测试失败");
+      }
+    } finally {
+      setTestLoading(false);
     }
   };
 
@@ -291,7 +404,10 @@ export default function AISettingsModal({ onClose, onSaved }: Props) {
                   <label className="block text-sm text-[var(--color-muted)] mb-1">协议</label>
                   <select
                     value={editing.protocol}
-                    onChange={(e) => setEditing({ ...editing, protocol: e.target.value as AIProtocol })}
+                    onChange={(e) => {
+                      setEditing({ ...editing, protocol: e.target.value as AIProtocol });
+                      invalidateDiagnostics();
+                    }}
                     className="w-full px-3 py-2 bg-[var(--color-input-bg)] border border-[var(--color-border)] rounded-lg text-sm focus:outline-none focus:border-[var(--color-primary)]"
                   >
                     <option value="openai">OpenAI 兼容</option>
@@ -306,11 +422,17 @@ export default function AISettingsModal({ onClose, onSaved }: Props) {
                 <input
                   type="password"
                   value={editing.apiKey}
-                  onChange={(e) => setEditing({ ...editing, apiKey: e.target.value })}
+                  onChange={(e) => {
+                    setEditing({ ...editing, apiKey: e.target.value });
+                    invalidateDiagnostics();
+                  }}
                   placeholder={presetHint?.keyPlaceholder || "sk-xxxx"}
                   className="w-full px-3 py-2 bg-[var(--color-input-bg)] border border-[var(--color-border)] rounded-lg text-sm focus:outline-none focus:border-[var(--color-primary)]"
                   autoComplete="off"
                 />
+                <p className="text-xs text-[var(--color-muted)] mt-1">
+                  API Key 保存在本机浏览器，调用时会经本站服务器转发给你选择的 AI 供应商，不落库、不记录。
+                </p>
               </div>
 
               <div>
@@ -318,7 +440,10 @@ export default function AISettingsModal({ onClose, onSaved }: Props) {
                 <input
                   type="text"
                   value={editing.baseUrl}
-                  onChange={(e) => setEditing({ ...editing, baseUrl: e.target.value })}
+                  onChange={(e) => {
+                    setEditing({ ...editing, baseUrl: e.target.value });
+                    invalidateDiagnostics();
+                  }}
                   placeholder={presetHint?.baseUrl || "https://api.example.com"}
                   className="w-full px-3 py-2 bg-[var(--color-input-bg)] border border-[var(--color-border)] rounded-lg text-sm focus:outline-none focus:border-[var(--color-primary)]"
                 />
@@ -327,13 +452,121 @@ export default function AISettingsModal({ onClose, onSaved }: Props) {
 
               <div>
                 <label className="block text-sm text-[var(--color-muted)] mb-1">模型</label>
-                <input
-                  type="text"
-                  value={editing.model}
-                  onChange={(e) => setEditing({ ...editing, model: e.target.value })}
-                  placeholder={presetHint?.model || "gpt-4o"}
-                  className="w-full px-3 py-2 bg-[var(--color-input-bg)] border border-[var(--color-border)] rounded-lg text-sm focus:outline-none focus:border-[var(--color-primary)]"
-                />
+                <div className="flex gap-2">
+                  <input
+                    type="text"
+                    value={editing.model}
+                    onChange={(e) => {
+                      setEditing({ ...editing, model: e.target.value });
+                      invalidateDiagnostics();
+                    }}
+                    placeholder={presetHint?.model || "gpt-4o"}
+                    className="flex-1 px-3 py-2 bg-[var(--color-input-bg)] border border-[var(--color-border)] rounded-lg text-sm focus:outline-none focus:border-[var(--color-primary)]"
+                  />
+                  <button
+                    type="button"
+                    onClick={handleFetchModels}
+                    disabled={modelsLoading}
+                    className="px-3 py-2 border border-[var(--color-border)] rounded-lg text-sm hover:border-[var(--color-primary)] transition-colors whitespace-nowrap disabled:opacity-50"
+                    title="从供应商接口获取可用模型列表"
+                  >
+                    {modelsLoading ? "获取中…" : "获取模型"}
+                  </button>
+                </div>
+
+                {/* Model list dropdown + manual input fallback */}
+                {showModelList && (
+                  <div className="mt-2 border border-[var(--color-border)] rounded-lg bg-[var(--color-input-bg)] overflow-hidden">
+                    {modelOptions.length > 0 && (
+                      <>
+                        <input
+                          type="text"
+                          value={modelSearch}
+                          onChange={(e) => setModelSearch(e.target.value)}
+                          placeholder="搜索模型…"
+                          className="w-full px-3 py-1.5 bg-transparent border-b border-[var(--color-border)] text-sm focus:outline-none"
+                        />
+                        <div className="max-h-40 overflow-y-auto">
+                          {modelOptions
+                            .filter((m) =>
+                              modelSearch
+                                ? m.id.toLowerCase().includes(modelSearch.toLowerCase()) ||
+                                  (m.displayName?.toLowerCase().includes(modelSearch.toLowerCase()) ?? false)
+                                : true,
+                            )
+                            .slice(0, 100)
+                            .map((m) => (
+                              <button
+                                key={m.id}
+                                type="button"
+                                onClick={() => {
+                                  setEditing({ ...editing, model: m.id });
+                                  invalidateDiagnostics();
+                                }}
+                                className={`w-full text-left px-3 py-1.5 text-xs hover:bg-[var(--color-primary)]/10 transition-colors ${
+                                  editing.model === m.id ? "text-[var(--color-primary)]" : ""
+                                }`}
+                              >
+                                <div className="font-medium">{m.id}</div>
+                                {m.description && (
+                                  <div className="text-[var(--color-muted)] text-[10px] truncate">{m.description}</div>
+                                )}
+                              </button>
+                            ))}
+                        </div>
+                      </>
+                    )}
+                    {modelsStale && (
+                      <p className="px-3 py-1.5 text-[10px] text-amber-400/80">
+                        配置已修改，列表与测试结果可能过期，请重新获取或测试
+                      </p>
+                    )}
+                    {modelsError && (
+                      <p className="px-3 py-1.5 text-[10px] text-red-400">{modelsError}</p>
+                    )}
+                    {!modelsLoading && modelOptions.length === 0 && !modelsError && (
+                      <p className="px-3 py-1.5 text-[10px] text-[var(--color-muted)]">
+                        可直接手动输入模型名称
+                      </p>
+                    )}
+                  </div>
+                )}
+              </div>
+
+              {/* Model connectivity test */}
+              <div className="border border-[var(--color-border)] rounded-lg p-3 space-y-2">
+                <div className="flex items-center justify-between gap-2">
+                  <span className="text-sm font-medium">模型接口测试</span>
+                  <button
+                    type="button"
+                    onClick={handleTestModel}
+                    disabled={testLoading}
+                    className="px-3 py-1.5 border border-[var(--color-border)] rounded-md text-xs hover:border-[var(--color-primary)] transition-colors disabled:opacity-50"
+                  >
+                    {testLoading ? "测试中…" : "测试模型"}
+                  </button>
+                </div>
+                {testStale && testResult && (
+                  <p className="text-[10px] text-amber-400/80">配置已修改，测试结果可能过期</p>
+                )}
+                {testError && (
+                  <p className="text-[10px] text-red-400">{testError}</p>
+                )}
+                {testResult && !testStale && (
+                  <div className="text-[11px] text-[var(--color-muted)] space-y-0.5">
+                    <div>供应商：{testResult.provider} · 模型：{testResult.model}</div>
+                    <div>耗时：{testResult.latencyMs} ms</div>
+                    <div className="truncate">返回：{testResult.output || "（空）"}</div>
+                    {testResult.warning && (
+                      <div className="text-amber-400/90">{testResult.warning}</div>
+                    )}
+                  </div>
+                )}
+                {!testResult && !testError && !testLoading && (
+                  <p className="text-[10px] text-[var(--color-muted)]">
+                    向所选模型发送最小生成请求，验证鉴权、模型与接口是否可用
+                  </p>
+                )}
               </div>
 
               <div className="flex gap-2 pt-1">

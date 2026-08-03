@@ -1,5 +1,5 @@
-import { getAIBaseUrl, getAIModel, getActiveProvider, type AIProtocol } from "@/lib/storage";
 import { getReviewRules, formatRulesForPrompt } from "@/lib/review-rules";
+import { generateAI, streamAI, AIClientError } from "@/lib/ai/client";
 
 /** User-maintained audit rules, appended to review/audit prompts. */
 function userAuditRules(): string {
@@ -9,13 +9,6 @@ function userAuditRules(): string {
 /** User-maintained writing guidance, appended to generation prompts. */
 function userWritingRules(): string {
   return formatRulesForPrompt(getReviewRules().writingRules, "【用户补充的撰写要求（必须遵守）】");
-}
-
-interface ProviderConfig {
-  protocol: AIProtocol;
-  apiKey: string;
-  baseUrl: string;
-  model: string;
 }
 
 const SOFT_COPYRIGHT_COMPLIANCE_RULES = `软著申报合规用语要求：
@@ -76,324 +69,33 @@ export function sanitizeSoftCopyrightText(text: string): string {
 }
 
 /**
- * Send an AI request through the service-worker proxy (avoids CORS), falling back
- * to a direct request when no worker is controlling the page — on a hard reload or
- * the very first visit the SW may not have claimed the client yet, and hitting
- * `/__ai_proxy__` unproxied returns the Next.js 404 HTML, which surfaced as an
- * unexplained failure.
+ * Retryable error codes: transient network/timeout/rate-limit failures worth a
+ * bounded retry before surfacing the failure to the user. Auth, model, and
+ * validation errors fail fast.
  */
-async function proxyFetch(url: string, init: RequestInit): Promise<Response> {
-  const body = JSON.stringify({
-    targetUrl: url,
-    method: init.method || "POST",
-    headers: init.headers,
-    body: init.body,
-  });
+const RETRYABLE_ERROR_CODES = new Set([
+  "UPSTREAM_TIMEOUT",
+  "UPSTREAM_UNREACHABLE",
+  "UPSTREAM_RATE_LIMITED",
+  "UPSTREAM_HTTP_ERROR",
+]);
 
-  const controlled =
-    typeof navigator !== "undefined" &&
-    "serviceWorker" in navigator &&
-    !!navigator.serviceWorker.controller;
-
-  if (controlled) {
-    const res = await fetch("/__ai_proxy__", {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body,
-    });
-    // The proxy always tags its responses; anything else means the request escaped
-    // the worker (404 HTML from the app router) → retry directly.
-    if (res.headers.get("X-AI-Proxy") || res.status !== 404) return res;
-  }
-
-  return fetch(url, init);
-}
-
-/** Ensure the AI proxy worker is active before the first request of a batch. */
-export async function ensureAIProxyReady(timeoutMs = 3000): Promise<boolean> {
-  if (typeof navigator === "undefined" || !("serviceWorker" in navigator)) return false;
-  if (navigator.serviceWorker.controller) return true;
-  try {
-    await navigator.serviceWorker.ready;
-  } catch {
-    return false;
-  }
-  if (navigator.serviceWorker.controller) return true;
-
-  // `ready` resolves once registered, but control of an already-loaded page only
-  // arrives with controllerchange. Wait briefly, then fall back to direct fetch.
-  return new Promise<boolean>((resolve) => {
-    const timer = setTimeout(() => {
-      navigator.serviceWorker.removeEventListener("controllerchange", onChange);
-      resolve(!!navigator.serviceWorker.controller);
-    }, timeoutMs);
-    const onChange = () => {
-      clearTimeout(timer);
-      navigator.serviceWorker.removeEventListener("controllerchange", onChange);
-      resolve(true);
-    };
-    navigator.serviceWorker.addEventListener("controllerchange", onChange);
-  });
-}
-
-/** Build OpenAI-compatible chat completions URL from a flexible base. */
-function openaiChatCompletionsUrl(baseUrl: string): string {
-  const b = baseUrl.replace(/\/+$/, "");
-  if (b.endsWith("/chat/completions")) return b;
-  // Already versioned path, e.g. https://open.bigmodel.cn/api/paas/v4
-  if (/\/v\d+$/i.test(b)) return `${b}/chat/completions`;
-  // Base already ends with /v1
-  if (/\/v1$/i.test(b)) return `${b}/chat/completions`;
-  return `${b}/v1/chat/completions`;
-}
-
-function claudeMessagesUrl(baseUrl: string): string {
-  const b = baseUrl.replace(/\/+$/, "");
-  if (b.endsWith("/messages")) return b;
-  if (/\/v1$/i.test(b)) return `${b}/messages`;
-  return `${b}/v1/messages`;
-}
-
-/** Extract text + finish reason from a single OpenAI/Claude/Gemini JSON payload. */
-function extractFromPayload(
-  data: Record<string, unknown>,
-  protocol: AIProtocol
-): { text: string; finishReason: string } {
-  if (protocol === "openai") {
-    const choices = data?.choices as Array<{
-      message?: { content?: string };
-      delta?: { content?: string };
-      text?: string;
-      finish_reason?: string | null;
-    }> | undefined;
-    const choice = choices?.[0];
-    const text =
-      choice?.message?.content ||
-      choice?.delta?.content ||
-      choice?.text ||
-      "";
-    // Stream chunks often have finish_reason: null — treat as continue so a later
-    // real reason (stop/length) can overwrite it in the aggregator.
-    const fr = choice?.finish_reason;
-    const finishReason = fr ? fr : choice?.delta ? "continue" : "stop";
-    return { text, finishReason };
-  }
-
-  if (protocol === "claude") {
-    // Non-stream: content[0].text
-    // Stream message_delta: delta.stop_reason
-    // Stream content_block_delta: delta.text
-    const content = data?.content as Array<{ type?: string; text?: string }> | undefined;
-    if (Array.isArray(content) && content.length > 0) {
-      const text = content
-        .filter((c) => c.type === "text" || typeof c.text === "string")
-        .map((c) => c.text || "")
-        .join("");
-      return {
-        text,
-        finishReason: (data?.stop_reason as string) || "end_turn",
-      };
-    }
-
-    const type = data?.type as string | undefined;
-    if (type === "content_block_delta") {
-      const delta = data?.delta as { type?: string; text?: string } | undefined;
-      return { text: delta?.text || "", finishReason: "continue" };
-    }
-    if (type === "message_delta") {
-      const delta = data?.delta as { stop_reason?: string } | undefined;
-      return { text: "", finishReason: delta?.stop_reason || "end_turn" };
-    }
-    if (type === "message_stop") {
-      return { text: "", finishReason: "end_turn" };
-    }
-    // message_start / content_block_start / ping — ignore
-    return { text: "", finishReason: "continue" };
-  }
-
-  // Gemini
-  const candidates = data?.candidates as Array<{
-    content?: { parts?: Array<{ text?: string }> };
-    finishReason?: string;
-  }> | undefined;
-  const cand = candidates?.[0];
-  const text = cand?.content?.parts?.map((p) => p.text || "").join("") || "";
-  return { text, finishReason: cand?.finishReason || "STOP" };
-}
-
-/**
- * Parse an AI API response that may be:
- * - plain JSON object
- * - SSE stream (`data: {...}` lines, with optional `: heartbeat` comments)
- * - NDJSON (one JSON object per line)
- *
- * Chinese reverse proxies often inject SSE heartbeats even for non-stream
- * requests, which makes `res.json()` throw:
- *   Unexpected token ':', ": heartbea"... is not valid JSON
- */
-async function parseAIResponse(
-  res: Response,
-  protocol: AIProtocol
-): Promise<{ text: string; finishReason: string }> {
-  const raw = await res.text();
-  const trimmed = raw.trim();
-
-  if (!trimmed) {
-    return { text: "", finishReason: "stop" };
-  }
-
-  // Fast path: pure JSON object/array
-  if (trimmed.startsWith("{") || trimmed.startsWith("[")) {
-    try {
-      const data = JSON.parse(trimmed) as Record<string, unknown>;
-      // OpenAI error body
-      if (data.error && typeof data.error === "object") {
-        const err = data.error as { message?: string };
-        throw new Error(err.message || "AI API 返回错误");
-      }
-      return extractFromPayload(data, protocol);
-    } catch (e) {
-      // Fall through to line-based parsing if it wasn't pure JSON
-      // (e.g. JSON followed by more data, or partial)
-      if (e instanceof Error && e.message.includes("AI API")) throw e;
-    }
-  }
-
-  // SSE / NDJSON / heartbeat-polluted body
-  let text = "";
-  let finishReason = "stop";
-  const lines = raw.split(/\r?\n/);
-
-  for (const line of lines) {
-    const s = line.trim();
-    if (!s) continue;
-
-    // SSE comment / heartbeat — e.g. ": heartbeat", ": keep-alive"
-    if (s.startsWith(":")) continue;
-
-    // SSE event name — ignore
-    if (s.startsWith("event:")) continue;
-    if (s.startsWith("id:")) continue;
-    if (s.startsWith("retry:")) continue;
-
-    let payload = s;
-    if (s.startsWith("data:")) {
-      payload = s.slice(5).trim();
-    }
-
-    if (!payload || payload === "[DONE]") {
-      if (payload === "[DONE]") finishReason = finishReason === "continue" ? "stop" : finishReason;
-      continue;
-    }
-
-    // Some proxies wrap as data: data: {...}
-    if (payload.startsWith("data:")) {
-      payload = payload.slice(5).trim();
-    }
-
-    if (!(payload.startsWith("{") || payload.startsWith("["))) continue;
-
-    try {
-      const data = JSON.parse(payload) as Record<string, unknown>;
-      if (data.error && typeof data.error === "object") {
-        const err = data.error as { message?: string };
-        throw new Error(err.message || "AI API 返回错误");
-      }
-      const part = extractFromPayload(data, protocol);
-      if (part.text) text += part.text;
-      if (part.finishReason && part.finishReason !== "continue") {
-        finishReason = part.finishReason;
-      }
-    } catch (e) {
-      if (e instanceof Error && e.message.includes("AI API")) throw e;
-      // skip malformed chunk
-    }
-  }
-
-  // Last resort: try to find a JSON object embedded in the text
-  if (!text) {
-    const match = trimmed.match(/\{[\s\S]*\}/);
-    if (match) {
-      try {
-        const data = JSON.parse(match[0]) as Record<string, unknown>;
-        return extractFromPayload(data, protocol);
-      } catch {
-        /* ignore */
-      }
-    }
-  }
-
-  return { text, finishReason };
-}
-
-function splitSystemMessages(messages: { role: string; content: string }[]) {
-  const system = messages.filter((m) => m.role === "system").map((m) => m.content).join("\n\n");
-  const rest = messages.filter((m) => m.role !== "system");
-  return { system, rest };
-}
-
-async function callAI(
-  messages: { role: string; content: string }[],
-  config: ProviderConfig,
-  maxTokens = 200
-): Promise<string> {
-  let url: string;
-  let headers: Record<string, string>;
-  let body: string;
-
-  if (config.protocol === "openai") {
-    url = openaiChatCompletionsUrl(config.baseUrl);
-    headers = { "Content-Type": "application/json", Authorization: `Bearer ${config.apiKey}` };
-    body = JSON.stringify({ model: config.model, max_tokens: maxTokens, messages });
-  } else if (config.protocol === "claude") {
-    const { system, rest } = splitSystemMessages(messages);
-    url = claudeMessagesUrl(config.baseUrl);
-    headers = {
-      "Content-Type": "application/json",
-      "x-api-key": config.apiKey,
-      "anthropic-version": "2023-06-01",
-      "anthropic-dangerous-direct-browser-access": "true",
-    };
-    body = JSON.stringify({
-      model: config.model,
-      max_tokens: maxTokens,
-      ...(system ? { system } : {}),
-      messages: rest,
-    });
-  } else {
-    const contents = messages
-      .filter((m) => m.role !== "system")
-      .map((m) => ({ role: m.role === "assistant" ? "model" : "user", parts: [{ text: m.content }] }));
-    const b = config.baseUrl.replace(/\/+$/, "");
-    url = `${b}/v1beta/models/${config.model}:generateContent?key=${config.apiKey}`;
-    headers = { "Content-Type": "application/json" };
-    body = JSON.stringify({ contents, generationConfig: { maxOutputTokens: maxTokens } });
-  }
-
-  const res = await proxyFetch(url, { method: "POST", headers, body });
-  if (!res.ok) {
-    const err = await res.text();
-    throw new Error(`AI API 错误 (${res.status}): ${err.slice(0, 200)}`);
-  }
-  const { text } = await parseAIResponse(res, config.protocol);
-  return text.trim();
+function isRetryable(err: unknown): boolean {
+  return err instanceof AIClientError && RETRYABLE_ERROR_CODES.has(err.code);
 }
 
 /**
  * Short-answer AI call. `maxTokens` defaults to 200 for one-line answers (name,
  * category); pass a larger budget for JSON payloads — 200 tokens truncates a
  * six-field Chinese JSON object mid-string and the parse silently fails.
+ *
+ * Requests go through the authenticated same-origin server endpoint, which
+ * constructs the upstream URL and credentials server-side — the browser never
+ * contacts the supplier directly, so there is no Service Worker / CORS hop.
  */
 export async function callAIForText(prompt: string, maxTokens = 200): Promise<string> {
-  const active = getActiveProvider();
-  if (!active) throw new Error("请先在设置中配置并启用一个 AI 提供商");
-  const config: ProviderConfig = {
-    protocol: active.protocol,
-    apiKey: active.apiKey,
-    baseUrl: active.baseUrl || getAIBaseUrl(),
-    model: active.model || getAIModel(),
-  };
-  return callAI([{ role: "user", content: prompt }], config, maxTokens);
+  const completion = await generateAI([{ role: "user", content: prompt }], maxTokens);
+  return completion.text.trim();
 }
 
 /**
@@ -1869,61 +1571,10 @@ export async function generateProjectMetadata(
 const MAX_TOKENS = 8192;
 
 export async function callAILong(messages: { role: string; content: string }[]): Promise<{ text: string; finishReason: string }> {
-  const active = getActiveProvider();
-  if (!active) throw new Error("请先在设置中配置并启用一个 AI 提供商");
-  const config: ProviderConfig = {
-    protocol: active.protocol,
-    apiKey: active.apiKey,
-    baseUrl: active.baseUrl || getAIBaseUrl(),
-    model: active.model || getAIModel(),
-  };
-
-  let url: string;
-  let headers: Record<string, string>;
-  let body: string;
-
-  if (config.protocol === "openai") {
-    url = openaiChatCompletionsUrl(config.baseUrl);
-    headers = { "Content-Type": "application/json", Authorization: `Bearer ${config.apiKey}` };
-    // stream:true is more reliable through reverse proxies that inject heartbeats
-    body = JSON.stringify({ model: config.model, max_tokens: MAX_TOKENS, stream: true, messages });
-  } else if (config.protocol === "claude") {
-    const { system, rest } = splitSystemMessages(messages);
-    url = claudeMessagesUrl(config.baseUrl);
-    headers = {
-      "Content-Type": "application/json",
-      "x-api-key": config.apiKey,
-      "anthropic-version": "2023-06-01",
-      "anthropic-dangerous-direct-browser-access": "true",
-    };
-    body = JSON.stringify({
-      model: config.model,
-      max_tokens: MAX_TOKENS,
-      stream: true,
-      ...(system ? { system } : {}),
-      messages: rest,
-    });
-  } else {
-    const contents = messages
-      .filter((m) => m.role !== "system")
-      .map((m) => ({ role: m.role === "assistant" ? "model" : "user", parts: [{ text: m.content }] }));
-    const systemInstruction = messages.find((m) => m.role === "system")?.content;
-    const b = config.baseUrl.replace(/\/+$/, "");
-    url = `${b}/v1beta/models/${config.model}:streamGenerateContent?alt=sse&key=${config.apiKey}`;
-    headers = { "Content-Type": "application/json" };
-    body = JSON.stringify({
-      contents,
-      ...(systemInstruction ? { systemInstruction: { parts: [{ text: systemInstruction }] } } : {}),
-      generationConfig: { maxOutputTokens: MAX_TOKENS },
-    });
-  }
-
-  const res = await proxyFetch(url, { method: "POST", headers, body });
-  if (!res.ok) {
-    const err = await res.text();
-    throw new Error(`AI API 错误 (${res.status}): ${err.slice(0, 200)}`);
-  }
-  return parseAIResponse(res, config.protocol);
+  // Streaming generation now goes through the authenticated same-origin
+  // endpoint; the server constructs the upstream request and parses the
+  // protocol-specific SSE/JSON into normalised delta/done events.
+  return streamAI(messages as Parameters<typeof streamAI>[0], MAX_TOKENS);
 }
 
 /**
@@ -1935,7 +1586,6 @@ async function callAILongJSON(
   messages: { role: string; content: string }[],
   label: string
 ): Promise<string> {
-  await ensureAIProxyReady();
   const MAX_RETRIES = 2;
   let lastError: unknown;
 
@@ -1947,16 +1597,15 @@ async function callAILongJSON(
       lastError = new Error(`${label}返回空内容`);
     } catch (e) {
       lastError = e;
-      const msg = e instanceof Error ? e.message : String(e);
-      // Auth failures and explicit API errors won't fix themselves.
-      if (/AI API 错误 \((400|401|403|404|422)\)/i.test(msg)) break;
+      // Auth, model, and validation errors won't fix themselves — fail fast.
+      if (!isRetryable(e)) break;
     }
   }
 
   const msg = lastError instanceof Error ? lastError.message : String(lastError);
-  if (/failed to fetch|networkerror|load failed/i.test(msg)) {
+  if (lastError instanceof AIClientError && lastError.code === "UPSTREAM_UNREACHABLE") {
     throw new Error(
-      `${label}请求失败：无法连接 AI 接口。请检查网络、API 地址是否可访问（若使用反向代理请确认其允许跨域），然后重试。`
+      `${label}请求失败：无法连接 AI 接口。请检查网络、API 地址是否可访问，然后重试。`
     );
   }
   throw new Error(`${label}失败：${msg}`);
@@ -2004,8 +1653,8 @@ async function callAILongWithRetry(
       return result;
     } catch (e) {
       lastError = e;
-      // 401/403: fail fast
-      if (/AI API 错误 \((401|403)\)/i.test(e instanceof Error ? e.message : String(e))) break;
+      // Auth, model, and validation errors fail fast — no point retrying.
+      if (!isRetryable(e)) break;
       if (retry >= MAX_RETRIES) break;
     }
   }
