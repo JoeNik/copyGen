@@ -8,6 +8,7 @@ import { AIError, AIErrorCodes } from "@/lib/server/ai/errors";
 
 export const runtime = "nodejs";
 export const dynamic = "force-dynamic";
+export const maxDuration = 300;
 
 const DEFAULT_MAX_TOKENS = 200;
 const MAX_MAX_TOKENS = 8192;

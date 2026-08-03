@@ -11,6 +11,33 @@ export interface ChangelogEntry {
 
 export const CHANGELOG: ChangelogEntry[] = [
   {
+    "hash": "dd03ff9",
+    "date": "2026-08-03",
+    "subject": "feat: AI 调用改走服务端代理，新增模型列表与接口测试",
+    "details": [
+      "修复浏览器 Service Worker 跨域 fetch 被拒后合成 502",
+      "「代理请求失败…Failed to fetch」的问题：AI 请求不再由浏览器",
+      "直连供应商，改为经认证的 Next.js Route Handler 转发。",
+      "服务端网关：",
+      "新增 /api/ai/{models,test,generate,stream}，均要求 GitHub 登录",
+      "出站地址策略：生产禁回环/私网/链路本地/云元数据，DNS 解析",
+      "后校验，不跟随重定向，超时映射",
+      "三协议适配器（OpenAI 兼容/Claude/Gemini）统一 URL 规范化、",
+      "鉴权头、响应解析与归一化 SSE；修复 Gemini /v1beta 重复拼接",
+      "结构化错误码，上游响应体截断脱敏，不含密钥/堆栈",
+      "客户端：",
+      "ai-helpers 不再构造供应商 URL/鉴权头，改调同源接口",
+      "重试按结构化错误码分类，保留章节断点与草稿语义",
+      "AISettingsModal 增加「获取模型」可搜索下拉+手输回退、",
+      "「测试模型」真实最小生成测试，配置改动标记结果过期",
+      "清理与文案：",
+      "删除 public/ai-worker.js，移除 SW 注册，新增注销旧 Worker 组件",
+      "修正用户协议/首页/页脚隐私文案（密钥经服务端转发、不落库）",
+      "新增 Vitest 测试框架与 .env.example",
+      "121 个测试通过，lint 仅剩既有基线问题。"
+    ]
+  },
+  {
     "hash": "fe28dd3",
     "date": "2026-08-01",
     "subject": "feat: improve copyright manual generation and review",
